@@ -32,6 +32,12 @@ does not hold (the procedure is incomplete, e.g. it does not know that
 ``q * x`` is ``0`` in ``ModInt<q>``), so a caller may only conclude equality
 from a positive answer.
 
+A rebuilt ``ModInt<M>`` value keeps its type: an integer literal in it sits
+next to an atom of that ring, so it is read modulo ``M``. A ``ModInt<M>``
+value that is a nonzero constant has no such rebuild (an integer literal
+alone is an ``Int``, and ``2`` is not ``2 mod M``), so :meth:`Normalizer.
+canonical` keeps that expression as written.
+
 Calls are atoms whatever their determinism: two occurrences of the same call
 are the same atom only if the caller has ensured the call is deterministic
 (the symbolic executor in :mod:`state_relations` replaces every
@@ -257,6 +263,22 @@ class StructForm:
 NormalForm = Union[ModIntForm, GroupForm, StructForm]
 
 
+@dataclass
+class KeptConstant:
+    """A ``ModInt<modulus>`` expression :meth:`Normalizer.canonical` kept as
+    written because its value is the nonzero constant *value* mod *modulus*.
+
+    FrogLang has no literal of type ``ModInt<q>``: an integer literal is an
+    ``Int``, so rebuilding the constant as one would drop the reduction mod
+    ``q`` (``(x + 1 + 1) - x == 0`` would become ``2 == 0``, false, although
+    it holds for ``q = 2``).
+    """
+
+    expr: frog_ast.Expression
+    value: int
+    modulus: frog_ast.Expression
+
+
 class Normalizer:
     """Computes normal forms and canonical rebuilds against one atom table."""
 
@@ -269,6 +291,9 @@ class Normalizer:
         self.namespace = namespace or {}
         self.atoms = AtomTable()
         self._generators: dict[str, sympy.Symbol] = {}
+        # Every expression canonical() kept as written (see KeptConstant), so
+        # that a pass can report a near miss.
+        self.kept_constants: list[KeptConstant] = []
 
     def _type(self, expr: frog_ast.Expression) -> Optional[frog_ast.Type]:
         """:func:`infer_type`, plus a call to a primitive method typed by the
@@ -334,12 +359,33 @@ class Normalizer:
 
         ModInt, Int and group-element subexpressions are rebuilt from their
         normal forms; everything else is rebuilt with canonical children.
+        One exception: a ``ModInt`` arithmetic expression whose value is a
+        nonzero constant has no ``ModInt``-typed rebuild, so it is kept as
+        written and recorded in :attr:`kept_constants`.
         """
         the_type = self._type(expr)
         if isinstance(the_type, (frog_ast.ModIntType, frog_ast.IntType)) and (
             _is_arithmetic(expr)
         ):
-            return self._rebuild_poly(self._poly(expr, the_type))
+            modulus = (
+                the_type.modulus if isinstance(the_type, frog_ast.ModIntType) else None
+            )
+            poly = self._poly(expr, the_type)
+            rebuilt = self._rebuild_in_ring(poly, modulus)
+            if rebuilt is not None:
+                return rebuilt
+            assert modulus is not None
+            self.kept_constants.append(
+                KeptConstant(
+                    copy.deepcopy(expr),
+                    int(sympy.expand(poly)),
+                    copy.deepcopy(modulus),
+                )
+            )
+            # Kept whole, not with canonical children: a child whose value is
+            # 0 would be rebuilt as the Int literal 0, and next to a literal
+            # sibling that would make the expression an Int again.
+            return copy.deepcopy(expr)
         if isinstance(the_type, frog_ast.GroupElemType) and _is_group_arithmetic(
             expr, self.type_map
         ):
@@ -349,12 +395,21 @@ class Normalizer:
         return self._canonical_children(expr)
 
     def rebuild_poly(self, poly: sympy.Expr) -> frog_ast.Expression:
-        """The canonical AST of a polynomial over this table's atoms."""
+        """The canonical AST of a polynomial over this table's atoms.
+
+        A constant term is rebuilt as an ``Int`` literal, which is the right
+        value only where the result is read modulo a group's order (an
+        exponent of that group) or sits next to an atom of the polynomial's
+        ring (``f - delta``). For a ``ModInt`` value in any other position use
+        :meth:`canonical`, which never drops a modulus.
+        """
         return self._rebuild_poly(poly)
 
-    def rebuild(self, form: NormalForm) -> frog_ast.Expression:
+    def rebuild(self, form: NormalForm) -> Optional[frog_ast.Expression]:
+        """The canonical AST of *form*, or None for a ``ModInt`` form whose
+        value is a nonzero constant (see :class:`KeptConstant`)."""
         if isinstance(form, ModIntForm):
-            return self._rebuild_poly(form.poly)
+            return self._rebuild_in_ring(form.poly, form.modulus)
         if isinstance(form, GroupForm):
             return self._rebuild_group(form)
         return copy.deepcopy(form.expr)
@@ -399,6 +454,23 @@ class Normalizer:
         if other is None:
             return False
         return bool(other == the_type)
+
+    def _rebuild_in_ring(
+        self, poly: sympy.Expr, modulus: Optional[frog_ast.Expression]
+    ) -> Optional[frog_ast.Expression]:
+        """The canonical AST of *poly* as a value of ``ModInt<modulus>`` (of
+        ``Int`` when *modulus* is None), or None when there is none.
+
+        A non-constant polynomial is rebuilt with an atom in its first term,
+        so the result has the ring's type and its integer literals are read
+        in that ring. A constant ``c`` is an ``Int`` literal: that is the
+        ``ModInt`` value only for ``c = 0`` (``0 mod q`` is ``0`` for every
+        ``q``), so any other constant of a ``ModInt`` ring gives None.
+        """
+        poly = sympy.expand(poly)
+        if modulus is not None and poly.is_number and poly != 0:
+            return None
+        return self._rebuild_poly(poly)
 
     def _rebuild_poly(self, poly: sympy.Expr) -> frog_ast.Expression:
         poly = sympy.expand(poly)

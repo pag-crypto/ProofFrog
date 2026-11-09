@@ -1760,6 +1760,38 @@ def _holds_its_value(definition: frog_ast.Assignment, type_map: NameTypeMap) -> 
     return value_type is not None and bool(value_type == definition.the_type)
 
 
+def _note_kept_constants(
+    normalizer: Normalizer, ctx: Optional[PipelineContext], transform_name: str
+) -> None:
+    """Report each ``ModInt`` constant *normalizer* kept as written.
+
+    Its value would need a ``ModInt<q>`` literal, which FrogLang lacks; the
+    ``Int`` literal would drop the reduction mod ``q``.
+    """
+    if ctx is None:
+        return
+    for kept in normalizer.kept_constants:
+        ctx.near_misses.append(
+            NearMiss(
+                transform_name=transform_name,
+                reason=(
+                    f"'{kept.expr}' is the constant {kept.value} in "
+                    f"ModInt<{kept.modulus}>, kept as written: the Int "
+                    f"literal {kept.value} would drop the reduction mod "
+                    f"{kept.modulus}"
+                ),
+                location=kept.expr.origin,
+                suggestion=(
+                    f"Bind the constant to a typed local "
+                    f"(ModInt<{kept.modulus}> c = {kept.value};) and use it "
+                    "on both sides"
+                ),
+                variable=None,
+                method=None,
+            )
+        )
+
+
 class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
     """Rewrites ModInt arithmetic whose terms cancel to its normal form.
 
@@ -1810,6 +1842,7 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
         )
         normalizer = Normalizer(self.type_map, self._proof_namespace)
         rebuilt = normalizer.canonical(expr)
+        _note_kept_constants(normalizer, self.ctx, "ModInt Cancellation")
         if node_count(rebuilt) >= node_count(expr):
             return None
         if deterministic:
@@ -3999,6 +4032,7 @@ class ExpressAfterUpdate(TransformPass):
                 rewritten = normalizer.canonical(
                     _substitute_variable(value, field, previous)
                 )
+                _note_kept_constants(normalizer, ctx, self.name)
                 # Compare with the value's own normal form, not its current
                 # spelling: the move is meant for a delta that cancels, and an
                 # unsimplified value (g^(s - D) * g^D) must not be moved past
@@ -4136,9 +4170,11 @@ class CancelThroughLocal(TransformPass):
                 referenced_variable_names(local_value) | {local}, between
             ):
                 continue
-            candidate = Normalizer(type_map).canonical(
+            normalizer = Normalizer(type_map)
+            candidate = normalizer.canonical(
                 _substitute_variable(current, local, local_value)
             )
+            _note_kept_constants(normalizer, ctx, self.name)
             if node_count(candidate) < node_count(current):
                 current = candidate
                 improved = True

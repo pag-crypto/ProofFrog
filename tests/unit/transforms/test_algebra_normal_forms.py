@@ -99,3 +99,88 @@ def test_canonical_rebuild_is_smaller_after_cancellation() -> None:
     rebuilt = normalizer.canonical(original)
     assert normalizer.equal(rebuilt, _expr("sk + d"))
     assert node_count(rebuilt) < node_count(original)
+
+
+# F-357: FrogLang has no ModInt<q> literal, so a ModInt<q> value that is a
+# nonzero constant must not be rebuilt as an Int literal (2 is not 2 mod q).
+
+
+@pytest.mark.parametrize(
+    "text,value",
+    [
+        ("((k + 1) + 1) - k", 2),
+        ("((k - k) + 1) + 1", 2),
+        ("(k + 1) * (k - 1) - k * k", -1),
+        ("(sk + 1) - sk", 1),
+    ],
+)
+def test_f357_nonzero_modint_constant_is_kept_as_written(text: str, value: int) -> None:
+    normalizer = Normalizer(_type_map())
+    original = _expr(text)
+    assert normalizer.canonical(original) == original
+    assert [kept.value for kept in normalizer.kept_constants] == [value]
+
+
+def test_f357_kept_constant_records_its_modulus() -> None:
+    normalizer = Normalizer(_type_map())
+    normalizer.canonical(_expr("((k + 1) + 1) - k"))
+    (kept,) = normalizer.kept_constants
+    assert kept.modulus == frog_ast.Variable("q")
+
+
+def test_f357_constant_exponent_of_other_modulus_is_kept() -> None:
+    # The exponent is a ModInt<q> value, q not the group order: an atom of
+    # the group algebra whose own arithmetic must keep its modulus.
+    normalizer = Normalizer(_type_map())
+    original = _expr("G.generator ^ (((k + 1) + 1) - k)")
+    assert normalizer.canonical(original) == original
+    assert [kept.value for kept in normalizer.kept_constants] == [2]
+
+
+def test_f357_constant_inside_atom_is_kept() -> None:
+    normalizer = Normalizer(_type_map())
+    rebuilt = normalizer.canonical(_expr("d + H(G.generator ^ (((k + 1) + 1) - k))"))
+    assert rebuilt == _expr("d + H(G.generator ^ (((k + 1) + 1) - k))")
+    assert len(normalizer.kept_constants) == 1
+
+
+def test_f357_zero_modint_constant_is_still_rebuilt() -> None:
+    # 0 mod q is 0 for every q.
+    normalizer = Normalizer(_type_map())
+    assert normalizer.canonical(_expr("(k + 1) - (1 + k)")) == frog_ast.Integer(0)
+    assert not normalizer.kept_constants
+
+
+def test_f357_non_constant_modint_still_folds() -> None:
+    # The literal sits next to the atom k, so it is read mod q.
+    normalizer = Normalizer(_type_map())
+    rebuilt = normalizer.canonical(_expr("((k + 1) + 1) - 0"))
+    assert rebuilt == _expr("k + 2")
+    assert not normalizer.kept_constants
+
+
+def test_f357_int_constant_still_folds() -> None:
+    normalizer = Normalizer(_type_map())
+    assert normalizer.canonical(_expr("(n + 2) - n")) == frog_ast.Integer(2)
+    assert not normalizer.kept_constants
+
+
+def test_f357_group_order_exponent_constant_still_folds() -> None:
+    # An exponent of the group's own order is read modulo that order, where
+    # the Int literal has the same effect.
+    normalizer = Normalizer(_type_map())
+    rebuilt = normalizer.canonical(_expr("G.generator ^ ((sk + 2) - sk)"))
+    assert rebuilt == _expr("G.generator ^ 2")
+    assert not normalizer.kept_constants
+
+
+def test_f357_rebuild_of_constant_modint_form() -> None:
+    import sympy
+
+    from proof_frog.transforms._algebra import ModIntForm
+
+    normalizer = Normalizer(_type_map())
+    q = frog_ast.Variable("q")
+    assert normalizer.rebuild(ModIntForm(q, sympy.Integer(2))) is None
+    assert normalizer.rebuild(ModIntForm(q, sympy.Integer(0))) == frog_ast.Integer(0)
+    assert normalizer.rebuild(ModIntForm(None, sympy.Integer(2))) == frog_ast.Integer(2)

@@ -4650,6 +4650,81 @@ def test_near_miss_modint_cancellation_blocked_by_nondeterminism() -> None:
     assert "ModInt Cancellation" in _names(ctx)
 
 
+def _kept_constant_reasons(ctx: PipelineContext, transform: str) -> list[str]:
+    return [
+        nm.reason
+        for nm in ctx.near_misses
+        if nm.transform_name == transform and "kept as written" in nm.reason
+    ]
+
+
+def test_near_miss_modint_cancellation_keeps_nonzero_constant() -> None:
+    # F-357: (x + 1 + 1) - x is 2 mod q; the Int literal 2 would drop the
+    # reduction, so the whole expression is not rewritten to it.
+    from proof_frog.transforms.algebraic import ModIntCancellation
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Int q) {
+            Bool f(ModInt<q> x, ModInt<q> y) {
+                return ((x + 1) + 1) - x == y;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    result = ModIntCancellation().apply(game, ctx)
+    assert "2 ==" not in str(result)
+    reasons = _kept_constant_reasons(ctx, "ModInt Cancellation")
+    assert reasons and "constant 2 in ModInt<q>" in reasons[0]
+
+
+def test_near_miss_express_after_update_keeps_nonzero_constant() -> None:
+    # F-357: the moved value's exponent (y + 1) - y is 1 mod q.
+    from proof_frog.transforms.algebraic import ExpressAfterUpdate
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G, Int q) {
+            ModInt<q> f;
+            GroupElem<G> Get(ModInt<q> d, ModInt<q> y) {
+                GroupElem<G> pk = G.generator ^ ((y + 1) - y) * G.generator ^ (f + d);
+                f = f + d;
+                return pk;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    result = ExpressAfterUpdate().apply(game, ctx)
+    assert "G.generator ^ 1" not in str(result)
+    reasons = _kept_constant_reasons(ctx, "Express After Update")
+    assert reasons and "constant 1 in ModInt<q>" in reasons[0]
+
+
+def test_near_miss_cancel_through_local_keeps_nonzero_constant() -> None:
+    # F-357: substituting v = x + 5 makes the exponent (x + 5) - x, which is
+    # 5 mod q; the rewrite to g ^ 5 is refused.
+    from proof_frog.transforms.algebraic import CancelThroughLocal
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G, Int q, Function<GroupElem<G>, ModInt<q>> H) {
+            ModInt<q> w;
+            ModInt<q> Get(ModInt<q> x) {
+                ModInt<q> v = x + 5;
+                w = v * v;
+                return x + H(G.generator ^ (v - x));
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert CancelThroughLocal().apply(game, ctx) == game
+    reasons = _kept_constant_reasons(ctx, "Cancel Through Local")
+    assert reasons and "constant 5 in ModInt<q>" in reasons[0]
+
+
 def test_near_miss_repeated_mask_with_different_partners() -> None:
     from proof_frog.transforms.algebraic import UniformModIntRepeatedMask
 
