@@ -184,3 +184,71 @@ def test_f357_rebuild_of_constant_modint_form() -> None:
     assert normalizer.rebuild(ModIntForm(q, sympy.Integer(2))) is None
     assert normalizer.rebuild(ModIntForm(q, sympy.Integer(0))) == frog_ast.Integer(0)
     assert normalizer.rebuild(ModIntForm(None, sympy.Integer(2))) == frog_ast.Integer(2)
+
+
+# F-378: a ModInt<q> value equal to 0 is rebuilt as the Int literal 0 only
+# where an Int operand does not change the operation around it. As the base
+# of a power (0 ^ 0 is the Int 1) or an operand of a division (0 / 0 is an
+# Int division) it is kept as written.
+
+
+@pytest.mark.parametrize(
+    "text,positions",
+    [
+        ("(k - k) ^ n", ["the base of a power"]),
+        ("(k - k) / (k - k)", ["an operand of a division"] * 2),
+        ("(k + 1) / ((k + 1) - (1 + k))", ["an operand of a division"]),
+        ("H(G.generator ^ ((k - k) / k))", ["an operand of a division"]),
+    ],
+)
+def test_f378_zero_in_int_sensitive_position_is_kept(
+    text: str, positions: list[str]
+) -> None:
+    normalizer = Normalizer(_type_map())
+    original = _expr(text)
+    assert normalizer.canonical(original) == original
+    assert [kept.position for kept in normalizer.kept_constants] == positions
+    assert all(kept.value == 0 for kept in normalizer.kept_constants)
+
+
+def test_f378_zero_power_base_inside_atom_is_kept() -> None:
+    # A power with a non-literal exponent is an atom of the polynomial; its
+    # base keeps the ModInt zero, so the sum is 2 * (k - k) ^ n, not the Int
+    # expression 2 * 0 ^ n.
+    normalizer = Normalizer(_type_map())
+    rebuilt = normalizer.canonical(_expr("(k - k) ^ n + (k - k) ^ n"))
+    assert rebuilt == _expr("2 * (k - k) ^ n")
+
+
+def test_f378_zero_with_position_is_kept_whole() -> None:
+    normalizer = Normalizer(_type_map())
+    original = _expr("((k + 1) - k) - 1")
+    assert normalizer.canonical(original, "the base of a power") == original
+    (kept,) = normalizer.kept_constants
+    assert (kept.value, kept.position) == (0, "the base of a power")
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # Under ==, next to a ModInt operand, or as an exponent, the Int 0 is
+        # read as 0 mod q.
+        ("(k - k) == k", "0 == k"),
+        ("G.generator ^ (k - k)", "G.generator ^ 0"),
+        ("(k - k) * k + k", "k"),
+        # An Int zero is exact in Int arithmetic.
+        ("(n - n) / (n - n)", "0 / 0"),
+    ],
+)
+def test_f378_zero_elsewhere_is_still_rebuilt(text: str, expected: str) -> None:
+    normalizer = Normalizer(_type_map())
+    assert normalizer.canonical(_expr(text)) == _expr(expected)
+    assert not normalizer.kept_constants
+
+
+def test_f378_power_of_zero_is_the_modint_constant_one() -> None:
+    # (k - k) ^ 0 is 1 mod q: a nonzero constant, kept as written (F-357).
+    normalizer = Normalizer(_type_map())
+    original = _expr("(k - k) ^ 0")
+    assert normalizer.canonical(original) == original
+    assert [(k.value, k.position) for k in normalizer.kept_constants] == [(1, None)]

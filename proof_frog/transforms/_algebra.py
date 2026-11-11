@@ -36,7 +36,12 @@ A rebuilt ``ModInt<M>`` value keeps its type: an integer literal in it sits
 next to an atom of that ring, so it is read modulo ``M``. A ``ModInt<M>``
 value that is a nonzero constant has no such rebuild (an integer literal
 alone is an ``Int``, and ``2`` is not ``2 mod M``), so :meth:`Normalizer.
-canonical` keeps that expression as written.
+canonical` keeps that expression as written. A ``ModInt<M>`` value equal to
+``0`` is rebuilt as the literal ``0`` (``0 mod M`` is ``0``) only where an
+``Int`` operand does not change the operation around it: as the base of a
+power or an operand of ``/`` it is kept as written too (``(x - x) ^ 0`` is
+not the ``Int`` power ``0 ^ 0``, nor ``(x - x) / (y - y)`` the ``Int``
+division ``0 / 0``).
 
 Calls are atoms whatever their determinism: two occurrences of the same call
 are the same atom only if the caller has ensured the call is deterministic
@@ -266,17 +271,20 @@ NormalForm = Union[ModIntForm, GroupForm, StructForm]
 @dataclass
 class KeptConstant:
     """A ``ModInt<modulus>`` expression :meth:`Normalizer.canonical` kept as
-    written because its value is the nonzero constant *value* mod *modulus*.
+    written because its value is the constant *value* mod *modulus*.
 
     FrogLang has no literal of type ``ModInt<q>``: an integer literal is an
-    ``Int``, so rebuilding the constant as one would drop the reduction mod
-    ``q`` (``(x + 1 + 1) - x == 0`` would become ``2 == 0``, false, although
-    it holds for ``q = 2``).
+    ``Int``, so rebuilding a nonzero constant as one would drop the reduction
+    mod ``q`` (``(x + 1 + 1) - x == 0`` would become ``2 == 0``, false,
+    although it holds for ``q = 2``). The constant ``0`` is kept only where
+    an ``Int`` operand changes the operation; *position* then names that
+    place (for example ``"the base of a power"``), and is None otherwise.
     """
 
     expr: frog_ast.Expression
     value: int
     modulus: frog_ast.Expression
+    position: Optional[str] = None
 
 
 class Normalizer:
@@ -354,7 +362,9 @@ class Normalizer:
             self.normal_form(left, the_type), self.normal_form(right, the_type)
         )
 
-    def canonical(self, expr: frog_ast.Expression) -> frog_ast.Expression:
+    def canonical(
+        self, expr: frog_ast.Expression, position: Optional[str] = None
+    ) -> frog_ast.Expression:
         """A canonical AST for *expr*: equal normal forms give equal ASTs.
 
         ModInt, Int and group-element subexpressions are rebuilt from their
@@ -362,6 +372,13 @@ class Normalizer:
         One exception: a ``ModInt`` arithmetic expression whose value is a
         nonzero constant has no ``ModInt``-typed rebuild, so it is kept as
         written and recorded in :attr:`kept_constants`.
+
+        *position*, when given, says that *expr* is an operand whose
+        replacement by an ``Int`` would change the operation it sits in (for
+        example ``"the base of a power"``). A ``ModInt`` value equal to ``0``
+        is then kept as written as well, since its rebuild is the ``Int``
+        literal ``0``. :meth:`_canonical_children` passes it for the
+        operands of ``^`` and ``/`` inside *expr*.
         """
         the_type = self._type(expr)
         if isinstance(the_type, (frog_ast.ModIntType, frog_ast.IntType)) and (
@@ -370,16 +387,19 @@ class Normalizer:
             modulus = (
                 the_type.modulus if isinstance(the_type, frog_ast.ModIntType) else None
             )
-            poly = self._poly(expr, the_type)
+            poly = sympy.expand(self._poly(expr, the_type))
             rebuilt = self._rebuild_in_ring(poly, modulus)
-            if rebuilt is not None:
+            if rebuilt is not None and not (
+                modulus is not None and position is not None and poly == 0
+            ):
                 return rebuilt
             assert modulus is not None
             self.kept_constants.append(
                 KeptConstant(
                     copy.deepcopy(expr),
-                    int(sympy.expand(poly)),
+                    int(poly),
                     copy.deepcopy(modulus),
+                    position if poly == 0 else None,
                 )
             )
             # Kept whole, not with canonical children: a child whose value is
@@ -636,10 +656,11 @@ class Normalizer:
                 self.canonical(expr.the_array), self.canonical(expr.index)
             )
         if isinstance(expr, frog_ast.BinaryOperation):
+            left_position, right_position = int_sensitive_operands(expr.operator)
             return frog_ast.BinaryOperation(
                 expr.operator,
-                self.canonical(expr.left_expression),
-                self.canonical(expr.right_expression),
+                self.canonical(expr.left_expression, left_position),
+                self.canonical(expr.right_expression, right_position),
             )
         if isinstance(expr, frog_ast.UnaryOperation):
             return frog_ast.UnaryOperation(
@@ -649,6 +670,25 @@ class Normalizer:
         if group is not None:
             return frog_ast.FieldAccess(copy.deepcopy(group), "generator")
         return copy.deepcopy(expr)
+
+
+def int_sensitive_operands(
+    operator: frog_ast.BinaryOperators,
+) -> tuple[Optional[str], Optional[str]]:
+    """For each operand of *operator* (left, right), the position it is in if
+    an ``Int`` there would change the operation, else None.
+
+    ``^`` takes its type from its base, so an ``Int`` base makes it an
+    ``Int`` power (``0 ^ 0`` is the ``Int`` 1, not ``1 mod q``); ``/`` on an
+    ``Int`` operand reads as ``Int`` division. An ``Int`` exponent is what
+    ``^`` expects, and next to a ``ModInt`` operand of ``+``, ``-`` or ``*``,
+    or under ``==``, an ``Int`` ``0`` is read as ``0 mod q``.
+    """
+    if operator == _Ops.EXPONENTIATE:
+        return "the base of a power", None
+    if operator == _Ops.DIVIDE:
+        return "an operand of a division", "an operand of a division"
+    return None, None
 
 
 def _is_arithmetic(expr: frog_ast.Expression) -> bool:

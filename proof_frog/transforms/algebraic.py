@@ -40,7 +40,7 @@ from ._base import (
     method_bound_names,
 )
 from ._coercion import coercing_store_names_for, note_coercing_store
-from ._algebra import Normalizer, infer_type, node_count
+from ._algebra import Normalizer, infer_type, int_sensitive_operands, node_count
 from ._definedness import method_binder_counts, note_redeclared_name, redeclared_names
 from ._ordering import node_sort_key
 from ._wrappers import GroupExponentWrapper, WrapperShape, _GroupExpShape
@@ -1767,11 +1767,31 @@ def _note_kept_constants(
     """Report each ``ModInt`` constant *normalizer* kept as written.
 
     Its value would need a ``ModInt<q>`` literal, which FrogLang lacks; the
-    ``Int`` literal would drop the reduction mod ``q``.
+    ``Int`` literal would drop the reduction mod ``q``, or, for a zero in
+    an ``Int``-sensitive position, make the operation an ``Int`` one.
     """
     if ctx is None:
         return
     for kept in normalizer.kept_constants:
+        if kept.position is not None:
+            ctx.near_misses.append(
+                NearMiss(
+                    transform_name=transform_name,
+                    reason=(
+                        f"'{kept.expr}' is 0 in ModInt<{kept.modulus}>, kept "
+                        f"as written: it is {kept.position}, where the Int "
+                        "literal 0 would make the operation an Int one"
+                    ),
+                    location=kept.expr.origin,
+                    suggestion=(
+                        "Write the expression without the vanishing term on "
+                        "both sides"
+                    ),
+                    variable=None,
+                    method=None,
+                )
+            )
+            continue
         ctx.near_misses.append(
             NearMiss(
                 transform_name=transform_name,
@@ -1821,6 +1841,10 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
         self._shadowed: set[str] = set()
         self._redeclared: set[str] = set()
         self._method_name: Optional[str] = None
+        # Operands (by id) where an Int would change the operation around
+        # them, with that position: a ModInt zero there is kept as written,
+        # since its rebuild is the Int literal 0.
+        self._int_sensitive: dict[int, str] = {}
         self.ctx = ctx
 
     def transform_method(self, method: frog_ast.Method) -> frog_ast.ASTNode:
@@ -1834,7 +1858,15 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
         finally:
             self._shadowed, self._redeclared, self._method_name = saved
 
-    def _try(self, expr: frog_ast.Expression) -> Optional[frog_ast.Expression]:
+    def _mark_int_sensitive(
+        self, operand: frog_ast.Expression, position: Optional[str]
+    ) -> None:
+        if position is not None:
+            self._int_sensitive[id(operand)] = position
+
+    def _try(
+        self, expr: frog_ast.Expression, position: Optional[str]
+    ) -> Optional[frog_ast.Expression]:
         if not isinstance(
             _get_expression_type(expr, self.type_map), frog_ast.ModIntType
         ):
@@ -1847,8 +1879,13 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
             self._shadowed,
         )
         normalizer = Normalizer(self.type_map, self._proof_namespace)
-        rebuilt = normalizer.canonical(expr)
+        rebuilt = normalizer.canonical(expr, position)
         _note_kept_constants(normalizer, self.ctx, "ModInt Cancellation")
+        kept = normalizer.kept_constants
+        if kept and kept[-1].position is not None and kept[-1].expr == expr:
+            # A zero kept as written stays whole, as the normalizer keeps it:
+            # its parts are not rewritten one by one either.
+            return expr
         if node_count(rebuilt) >= node_count(expr):
             return None
         # A name with several bindings may have another type here than the
@@ -1884,19 +1921,47 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
     def transform_binary_operation(
         self, binary_operation: frog_ast.BinaryOperation
     ) -> frog_ast.Expression:
-        if binary_operation.operator in (
+        operator = binary_operation.operator
+        left = binary_operation.left_expression
+        right = binary_operation.right_expression
+        position = self._int_sensitive.pop(id(binary_operation), None)
+        if operator in (
             frog_ast.BinaryOperators.ADD,
             frog_ast.BinaryOperators.SUBTRACT,
             frog_ast.BinaryOperators.MULTIPLY,
         ):
-            rebuilt = self._try(binary_operation)
+            rebuilt = self._try(binary_operation, position)
             if rebuilt is not None:
                 return rebuilt
+            # The operands are rewritten one at a time. An operand rebuilt as
+            # the Int literal 0 is read as 0 mod q only next to a ModInt
+            # operand; under an Int-sensitive position, or next to an Int
+            # (literal) operand, it would turn this operation into an Int one.
+            self._mark_int_sensitive(left, position or self._int_operand(right))
+            self._mark_int_sensitive(right, position or self._int_operand(left))
+        else:
+            left_position, right_position = int_sensitive_operands(operator)
+            self._mark_int_sensitive(left, left_position)
+            self._mark_int_sensitive(right, right_position)
         return frog_ast.BinaryOperation(
-            binary_operation.operator,
-            self.transform(binary_operation.left_expression),
-            self.transform(binary_operation.right_expression),
+            operator, self.transform(left), self.transform(right)
         )
+
+    def transform_unary_operation(
+        self, unary_operation: frog_ast.UnaryOperation
+    ) -> frog_ast.Expression:
+        # -e has the type of e, so an Int operand makes it an Int negation.
+        position = self._int_sensitive.pop(id(unary_operation), None)
+        if unary_operation.operator == frog_ast.UnaryOperators.MINUS:
+            self._mark_int_sensitive(unary_operation.expression, position)
+        return self._transform_children(unary_operation)
+
+    def _int_operand(self, sibling: frog_ast.Expression) -> Optional[str]:
+        """The position of an operand of ``+``, ``-`` or ``*`` whose *sibling*
+        reads as an ``Int`` (an integer literal), else None."""
+        if isinstance(_get_expression_type(sibling, self.type_map), frog_ast.IntType):
+            return "an operand next to an Int"
+        return None
 
 
 class ModIntCancellation(TransformPass):

@@ -106,3 +106,51 @@ def test_f370_sibling_declarations_are_not_typed_by_the_last_one() -> None:
     assert str(branch.blocks[0].statements[-1]).strip() == (
         "return b * (a / (d * d) * d ^ 2) + e;"
     )
+
+
+# F-378: a ModInt zero is rebuilt as the Int literal 0 only where an Int
+# operand does not change the operation around it.
+
+
+def test_f378_zero_power_base_is_kept() -> None:
+    # (a - a) ^ 0 is 1 mod q; with the Int 0 as its base it would be the Int
+    # power 0 ^ 0. The comparison's b - b still cancels.
+    _, result = _apply("return (a - a) ^ 0 + (a - a) ^ 0 == b - b;")
+    assert _return_of(result) == frog_parser.parse_expression(
+        "(a - a) ^ 0 + (a - a) ^ 0 == 0"
+    )
+
+
+def test_f378_zero_division_operands_are_kept() -> None:
+    # 0 / 0 would be an Int division.
+    game, result = _apply("return (a - a) / (b - b);")
+    assert result == game
+
+
+def test_f378_zero_under_negation_in_power_base_is_kept() -> None:
+    # -e has the type of e: -0 would make the power an Int one.
+    game, result = _apply("return (-(a - a)) ^ 0;")
+    assert result == game
+
+
+def test_f378_zero_next_to_int_literal_is_kept() -> None:
+    # (a - a) + 1 is 1 mod q, kept whole (F-357); its zero operand is not
+    # rewritten either, since 0 + 1 would be the Int 1.
+    game, result = _apply("return (a - a) + 1;")
+    assert result == game
+
+
+def test_f378_kept_zero_stays_whole() -> None:
+    # The parts of a kept zero are not rewritten one by one: the base does
+    # not become b - b.
+    game, result = _apply("return ((a + b) - a - b) ^ 2;")
+    assert result == game
+
+
+def test_f378_zero_elsewhere_still_cancels() -> None:
+    _, result = _apply("return (a - a) * b + d;")
+    assert _return_of(result) == frog_parser.parse_expression("d")
+    _, result = _apply("return a - a;")
+    assert _return_of(result) == frog_ast.Integer(0)
+    _, result = _apply("return (a - a) == b;")
+    assert _return_of(result) == frog_parser.parse_expression("0 == b")

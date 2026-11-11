@@ -4844,6 +4844,54 @@ def test_near_miss_cancel_through_local_keeps_nonzero_constant() -> None:
     assert reasons and "constant 5 in ModInt<q>" in reasons[0]
 
 
+def test_near_miss_modint_cancellation_keeps_zero_power_base() -> None:
+    # F-378: x - x is 0 mod q, but as the base of a power the Int literal 0
+    # would make (x - x) ^ 0 the Int power 0 ^ 0.
+    from proof_frog.transforms.algebraic import ModIntCancellation
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Int q) {
+            Bool f(ModInt<q> x, ModInt<q> y) {
+                return (x - x) ^ 0 + (x - x) ^ 0 == y;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert ModIntCancellation().apply(game, ctx) == game
+    reasons = _kept_constant_reasons(ctx, "ModInt Cancellation")
+    assert any(
+        "is 0 in ModInt<q>" in r and "the base of a power" in r for r in reasons
+    )
+
+
+def test_near_miss_cancel_through_local_keeps_zero_division_operand() -> None:
+    # F-378: substituting v = x makes the operands (x - x) and (y - y), both
+    # 0 mod q; the rewrite to the Int division 0 / 0 is refused.
+    from proof_frog.transforms.algebraic import CancelThroughLocal
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Int q) {
+            ModInt<q> w;
+            ModInt<q> Get(ModInt<q> x, ModInt<q> y) {
+                ModInt<q> v = x;
+                w = v * v;
+                return (v - x) / (y - y);
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert CancelThroughLocal().apply(game, ctx) == game
+    reasons = _kept_constant_reasons(ctx, "Cancel Through Local")
+    assert any(
+        "is 0 in ModInt<q>" in r and "an operand of a division" in r
+        for r in reasons
+    )
+
+
 def test_near_miss_repeated_mask_with_different_partners() -> None:
     from proof_frog.transforms.algebraic import UniformModIntRepeatedMask
 
