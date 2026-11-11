@@ -4630,6 +4630,125 @@ def test_near_miss_offset_read_on_its_own() -> None:
     assert "Offset Fusion" in _names(ctx)
 
 
+def _removed_field_misses(ctx: PipelineContext, transform: str) -> list[NearMiss]:
+    return [
+        nm
+        for nm in ctx.near_misses
+        if nm.transform_name == transform and "Removing field" in nm.reason
+    ]
+
+
+def test_near_miss_invariant_field_named_by_another_field() -> None:
+    from proof_frog.transforms.state_relations import FieldInvariantElimination
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            Int a;
+            Int b;
+            Int q = a;
+            Void Initialize(Int s) {
+                b = s;
+                a = s + 1;
+            }
+            Int Step() {
+                a = a + 1;
+                b = b + 1;
+                return a + q;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert FieldInvariantElimination().apply(game, ctx) == game
+    (miss,) = _removed_field_misses(ctx, "Field Invariant Elimination")
+    assert miss.variable == "a" and "field 'q'" in miss.reason
+
+
+def test_near_miss_invariant_field_named_in_a_type_before_its_local() -> None:
+    from proof_frog.transforms.state_relations import FieldInvariantElimination
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            Int a;
+            Int b;
+            Void Initialize(Int s) {
+                b = s;
+                a = s + 1;
+            }
+            Int Samp() {
+                BitString<a> x <- BitString<a>;
+                a = a + 1;
+                b = b + 1;
+                return |x|;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert FieldInvariantElimination().apply(game, ctx) == game
+    (miss,) = _removed_field_misses(ctx, "Field Invariant Elimination")
+    assert miss.variable == "a" and miss.method == "Samp"
+
+
+def test_near_miss_group_field_named_by_another_field() -> None:
+    from proof_frog.transforms.state_relations import GeneratorPowerFieldToExponent
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            GroupElem<G> P;
+            GroupElem<G> Q = P;
+            Void Initialize() {
+                ModInt<G.order> e <- ModInt<G.order>;
+                P = G.generator ^ e;
+            }
+            GroupElem<G> Upd(ModInt<G.order> d) {
+                P = P * G.generator ^ d;
+                return Q;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert GeneratorPowerFieldToExponent().apply(game, ctx) == game
+    (miss,) = _removed_field_misses(ctx, "Generator Power Field To Exponent")
+    assert miss.variable == "P" and "field 'Q'" in miss.reason
+
+
+def test_near_miss_fixed_key_named_by_another_field() -> None:
+    from proof_frog.transforms.state_relations import OffsetFusion
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            GroupElem<G> P;
+            ModInt<G.order> D;
+            GroupElem<G> Q = P;
+            Void Initialize() {
+                ModInt<G.order> e <- ModInt<G.order>;
+                P = G.generator ^ e;
+                D = 0;
+            }
+            GroupElem<G> Shift(ModInt<G.order> r) {
+                D = D + r;
+                return P * G.generator ^ D;
+            }
+            GroupElem<G> GetQ() {
+                return Q;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert OffsetFusion().apply(game, ctx) == game
+    misses = _removed_field_misses(ctx, "Offset Fusion")
+    assert misses and all(
+        nm.variable == "P" and "field 'Q'" in nm.reason for nm in misses
+    )
+
+
 def test_near_miss_modint_cancellation_blocked_by_nondeterminism() -> None:
     from proof_frog.transforms.algebraic import ModIntCancellation
 

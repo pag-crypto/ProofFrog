@@ -26,6 +26,15 @@ on every execution. Branch conditions are ignored (every syntactic path is
 checked) and loops havoc what they write, so the check over-approximates the
 executions. Induction over oracle calls then gives ``a == E`` at every call
 boundary, and removing ``a`` is an exact rewrite.
+
+Removing a field (these passes and :class:`OffsetFusion`). Each pass
+rewrites the reads of the removed field that it understands, then
+:func:`_unbound_reference` checks that the new game names the field nowhere
+else without a binding in scope: not in another field's type or initializer,
+not in a signature, and not in a type, sampled-from set or literal length in
+a method body outside the locals the pass declares. Otherwise the pass keeps
+the field (with a near miss), since such a name would now refer to something
+else, such as a proof ``let:`` entry of the same name.
 """
 
 from __future__ import annotations
@@ -92,12 +101,18 @@ def _map_expression(
                 frog_ast.Boolean,
                 frog_ast.NoneExpression,
                 frog_ast.BinaryNum,
-                frog_ast.BitStringLiteral,
-                frog_ast.GroupGenerator,
-                frog_ast.GroupOrder,
             ),
         ):
             return copy.deepcopy(node)
+        # The length of ``0^n`` / ``1^n`` and the group of ``G.generator`` /
+        # ``G.order`` are expressions too: ``1^c`` before and after ``c = c +
+        # 1`` are different values.
+        if isinstance(node, frog_ast.BitStringLiteral):
+            return frog_ast.BitStringLiteral(node.bit, walk(node.length))
+        if isinstance(node, frog_ast.GroupGenerator):
+            return frog_ast.GroupGenerator(walk(node.group))
+        if isinstance(node, frog_ast.GroupOrder):
+            return frog_ast.GroupOrder(walk(node.group))
         if isinstance(node, frog_ast.FuncCall):
             call = frog_ast.FuncCall(walk(node.func), [walk(a) for a in node.args])
             return on_call(call) if on_call is not None else call
@@ -157,6 +172,121 @@ def _mentions(node: frog_ast.ASTNode, name: str) -> bool:
             lambda n: isinstance(n, frog_ast.Variable) and n.name == name
         ).visit(node)
         is not None
+    )
+
+
+# ---------------------------------------------------------------------------
+# References to a removed field
+# ---------------------------------------------------------------------------
+
+
+def _binding_parts(
+    statement: frog_ast.Statement, name: str
+) -> Optional[list[Optional[frog_ast.ASTNode]]]:
+    """If *statement* declares a local *name*, the parts of it evaluated
+    before that binding exists (its type and value); otherwise None."""
+    if isinstance(statement, frog_ast.VariableDeclaration):
+        return [statement.type] if statement.name == name else None
+    if not isinstance(
+        statement, (frog_ast.Assignment, frog_ast.Sample, frog_ast.UniqueSample)
+    ):
+        return None
+    if statement.the_type is None or statement.var != frog_ast.Variable(name):
+        return None
+    if isinstance(statement, frog_ast.Assignment):
+        return [statement.the_type, statement.value]
+    if isinstance(statement, frog_ast.Sample):
+        return [statement.the_type, statement.sampled_from]
+    return [statement.the_type, statement.unique_set, statement.sampled_from]
+
+
+def _reads_unbound(statements: list[frog_ast.Statement], name: str) -> bool:
+    """True if *statements* name *name* (in any position: a value, a type,
+    a literal's length, an l-value) where no local declaration of *name* in
+    an enclosing block precedes it."""
+    for statement in statements:
+        parts = _binding_parts(statement, name)
+        if parts is not None:
+            # The rest of this block reads the new local.
+            return any(p is not None and _mentions(p, name) for p in parts)
+        if isinstance(statement, frog_ast.IfStatement):
+            if any(_mentions(c, name) for c in statement.conditions) or any(
+                _reads_unbound(list(b.statements), name) for b in statement.blocks
+            ):
+                return True
+        elif isinstance(statement, frog_ast.NumericFor):
+            if _mentions(statement.start, name) or _mentions(statement.end, name):
+                return True
+            if statement.name != name and _reads_unbound(
+                list(statement.block.statements), name
+            ):
+                return True
+        elif isinstance(statement, frog_ast.GenericFor):
+            if _mentions(statement.var_type, name) or _mentions(statement.over, name):
+                return True
+            if statement.var_name != name and _reads_unbound(
+                list(statement.block.statements), name
+            ):
+                return True
+        elif isinstance(statement, frog_ast.Block):
+            if _reads_unbound(list(statement.statements), name):
+                return True
+        elif _mentions(statement, name):
+            return True
+    return False
+
+
+def _unbound_reference(
+    game: frog_ast.Game, name: str
+) -> Optional[tuple[str, Optional[str]]]:
+    """Where *game*, from which a pass removed the field *name*, still names
+    it with nothing in scope to bind it: (a description, the method or None).
+
+    The pass rewrites the reads it understands into its replacement (or into
+    locals it declares). Any other occurrence would now refer to whatever
+    else is called *name* (a proof ``let:`` entry, or nothing at all) and
+    silently change the game: another field's type or initializer (which
+    runs before Initialize, when the removed field held its default), a
+    method signature, or, in a method body, a type, a sampled-from set or a
+    bit-string literal's length that is not under one of those locals. The
+    pass then keeps the field.
+    """
+    for field in game.fields:
+        if _mentions(field, name):
+            return f"the declaration of field '{field.name}'", None
+    for method in game.methods:
+        method_name = method.signature.name
+        if _mentions(method.signature, name):
+            return f"the signature of '{method_name}'", method_name
+        if any(p.name == name for p in method.signature.parameters):
+            continue
+        if _reads_unbound(list(method.block.statements), name):
+            return f"a statement of '{method_name}'", method_name
+    return None
+
+
+def _note_unbound_reference(
+    ctx: PipelineContext,
+    transform_name: str,
+    name: str,
+    where: tuple[str, Optional[str]],
+) -> None:
+    description, method = where
+    ctx.near_misses.append(
+        NearMiss(
+            transform_name=transform_name,
+            reason=(
+                f"Removing field '{name}' would leave {description} naming "
+                f"'{name}' with nothing in scope to bind it"
+            ),
+            location=None,
+            suggestion=(
+                f"Name '{name}' only in method bodies, as a value: not in "
+                "another field's declaration, a signature or a type"
+            ),
+            variable=name,
+            method=method,
+        )
     )
 
 
@@ -889,8 +1019,13 @@ class FieldInvariantElimination(TransformPass):
                 new_game = _eliminate(game, target, expr)
             except _Unsupported:
                 new_game = None
-            if new_game is not None:
-                return new_game
+            if new_game is None:
+                continue
+            where = _unbound_reference(new_game, target)
+            if where is not None:
+                _note_unbound_reference(ctx, self.name, target, where)
+                continue
+            return new_game
         return game
 
 
@@ -1097,7 +1232,9 @@ class GeneratorPowerFieldToExponent(TransformPass):
         new_game = frog_ast.Game(
             (game.name, copy.deepcopy(game.parameters), new_fields, new_methods)
         )
-        if _mentions(frog_ast.Block([m.block for m in new_methods]), name):
+        where = _unbound_reference(new_game, name)
+        if where is not None:
+            _note_unbound_reference(ctx, self.name, name, where)
             return None
         return new_game
 
@@ -1453,7 +1590,9 @@ def _fuse(  # pylint: disable=too-many-return-statements,too-many-locals
     fused = frog_ast.Game(
         (game.name, copy.deepcopy(game.parameters), new_fields, new_methods)
     )
-    if _mentions(frog_ast.Block([m.block for m in new_methods]), name):
+    where = _unbound_reference(fused, name)
+    if where is not None:
+        _note_unbound_reference(ctx, OffsetFusion.name, name, where)
         return None
     return fused
 
