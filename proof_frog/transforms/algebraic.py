@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import functools
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .. import frog_ast
@@ -40,7 +41,7 @@ from ._base import (
 )
 from ._coercion import coercing_store_names_for, note_coercing_store
 from ._algebra import Normalizer, infer_type, node_count
-from ._definedness import method_binder_counts
+from ._definedness import method_binder_counts, note_redeclared_name, redeclared_names
 from ._ordering import node_sort_key
 from ._wrappers import GroupExponentWrapper, WrapperShape, _GroupExpShape
 
@@ -1818,15 +1819,20 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
         self._proof_namespace = proof_namespace
         self._proof_let_types = proof_let_types
         self._shadowed: set[str] = set()
+        self._redeclared: set[str] = set()
+        self._method_name: Optional[str] = None
         self.ctx = ctx
 
     def transform_method(self, method: frog_ast.Method) -> frog_ast.ASTNode:
-        saved = self._shadowed
+        saved = (self._shadowed, self._redeclared, self._method_name)
         self._shadowed = method_bound_names(method)
+        # The type map gives a name one type for the whole method.
+        self._redeclared = redeclared_names(self._scope_game, method)
+        self._method_name = method.signature.name
         try:
             return super().transform_method(method)
         finally:
-            self._shadowed = saved
+            self._shadowed, self._redeclared, self._method_name = saved
 
     def _try(self, expr: frog_ast.Expression) -> Optional[frog_ast.Expression]:
         if not isinstance(
@@ -1844,6 +1850,14 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
         rebuilt = normalizer.canonical(expr)
         _note_kept_constants(normalizer, self.ctx, "ModInt Cancellation")
         if node_count(rebuilt) >= node_count(expr):
+            return None
+        # A name with several bindings may have another type here than the
+        # one the map gives it (F-370).
+        redeclared = sorted(referenced_variable_names(expr) & self._redeclared)
+        if redeclared:
+            note_redeclared_name(
+                self.ctx, "ModInt Cancellation", redeclared[0], self._method_name
+            )
             return None
         if deterministic:
             return rebuilt
@@ -3737,11 +3751,24 @@ class UniformModIntRepeatedMaskTransformer(BlockTransformer):
         proof_let_types: Optional[NameTypeMap],
         function_fields: NameTypeMap,
         ctx: Optional[PipelineContext] = None,
+        game: Optional[frog_ast.Game] = None,
     ) -> None:
         self.proof_namespace = proof_namespace
         self.proof_let_types = proof_let_types
         self.function_fields = function_fields
         self.ctx = ctx
+        self.game = game
+        self._redeclared: set[str] = set()
+        self._method_name: Optional[str] = None
+
+    def transform_method(self, method: frog_ast.Method) -> frog_ast.ASTNode:
+        saved = (self._redeclared, self._method_name)
+        self._redeclared = redeclared_names(self.game, method)
+        self._method_name = method.signature.name
+        try:
+            return self._transform_children(method)
+        finally:
+            self._redeclared, self._method_name = saved
 
     def _near_miss(self, name: str, why: str) -> None:
         if self.ctx is None:
@@ -3824,6 +3851,19 @@ class UniformModIntRepeatedMaskTransformer(BlockTransformer):
                 for p in parents
             ):
                 continue
+            # A second binding of u (or of a name of e) between the draw and
+            # the user is invisible to the name-based scans above (F-370).
+            redeclared = sorted(
+                ({name} | referenced_variable_names(other)) & self._redeclared
+            )
+            if redeclared:
+                note_redeclared_name(
+                    self.ctx,
+                    "Uniform ModInt Repeated Mask",
+                    redeclared[0],
+                    self._method_name,
+                )
+                continue
             new_user: frog_ast.ASTNode = user
             for parent in parents:
                 new_user = ReplaceTransformer(
@@ -3853,7 +3893,7 @@ class UniformModIntRepeatedMask(TransformPass):
             ):
                 function_fields.set(field.name, field.type)
         return UniformModIntRepeatedMaskTransformer(
-            ctx.proof_namespace, ctx.proof_let_types, function_fields, ctx
+            ctx.proof_namespace, ctx.proof_let_types, function_fields, ctx, game
         ).transform(game)
 
 
@@ -3883,6 +3923,34 @@ def _substitute_variable(
     return result
 
 
+@dataclass
+class _MethodScope:
+    """What a statement-moving algebra pass knows about the method it
+    rewrites: the method's type map, the names it binds, the names it binds
+    more than once (or that shadow a field), and its name."""
+
+    type_map: NameTypeMap
+    shadowed: set[str]
+    redeclared: set[str]
+    method_name: str
+
+    def declines(
+        self,
+        ctx: PipelineContext,
+        transform_name: str,
+        names: set[str],
+    ) -> bool:
+        """True, with a near miss, if a rewrite reading or binding *names*
+        must be declined because one of them has several bindings: the type
+        map gives it one type for the whole method, and a name-based scan
+        does not see which binding an occurrence reads (F-370)."""
+        redeclared = sorted(names & self.redeclared)
+        if not redeclared:
+            return False
+        note_redeclared_name(ctx, transform_name, redeclared[0], self.method_name)
+        return True
+
+
 class ExpressAfterUpdate(TransformPass):
     """Move a value computed just before an additive update after it.
 
@@ -3908,9 +3976,13 @@ class ExpressAfterUpdate(TransformPass):
         new_methods = []
         changed = False
         for method in game.methods:
-            type_map = build_method_type_map(game, method, ctx.proof_let_types)
-            shadowed = method_bound_names(method)
-            block = self._block(method.block, type_map, ctx, shadowed)
+            scope = _MethodScope(
+                build_method_type_map(game, method, ctx.proof_let_types),
+                method_bound_names(method),
+                redeclared_names(game, method),
+                method.signature.name,
+            )
+            block = self._block(method.block, scope, ctx)
             if block is not method.block:
                 changed = True
             new_methods.append(
@@ -3925,19 +3997,18 @@ class ExpressAfterUpdate(TransformPass):
     def _block(
         self,
         block: frog_ast.Block,
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
     ) -> frog_ast.Block:
         statements = list(block.statements)
         changed = False
         for index, statement in enumerate(statements):
-            inner = self._nested(statement, type_map, ctx, shadowed)
+            inner = self._nested(statement, scope, ctx)
             if inner is not statement:
                 statements[index] = inner
                 changed = True
         while True:
-            moved = self._move_one(statements, type_map, ctx, shadowed)
+            moved = self._move_one(statements, scope, ctx)
             if moved is None:
                 break
             statements = moved
@@ -3947,12 +4018,11 @@ class ExpressAfterUpdate(TransformPass):
     def _nested(
         self,
         statement: frog_ast.Statement,
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
     ) -> frog_ast.Statement:
         if isinstance(statement, frog_ast.IfStatement):
-            blocks = [self._block(b, type_map, ctx, shadowed) for b in statement.blocks]
+            blocks = [self._block(b, scope, ctx) for b in statement.blocks]
             if all(new is old for new, old in zip(blocks, statement.blocks)):
                 return statement
             return frog_ast.IfStatement(statement.conditions, blocks)
@@ -3961,10 +4031,10 @@ class ExpressAfterUpdate(TransformPass):
     def _move_one(
         self,
         statements: list[frog_ast.Statement],
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
     ) -> Optional[list[frog_ast.Statement]]:
+        type_map, shadowed = scope.type_map, scope.shadowed
         for w, update in enumerate(statements):
             if not (
                 isinstance(update, frog_ast.Assignment)
@@ -4039,6 +4109,14 @@ class ExpressAfterUpdate(TransformPass):
                 # the update just because any rewrite of it is smaller.
                 if node_count(rewritten) >= node_count(normalizer.canonical(value)):
                     continue
+                if scope.declines(
+                    ctx,
+                    self.name,
+                    {field, local}
+                    | referenced_variable_names(update.value)
+                    | referenced_variable_names(value),
+                ):
+                    continue
                 moved = frog_ast.Assignment(
                     copy.deepcopy(candidate.the_type),
                     frog_ast.Variable(local),
@@ -4084,9 +4162,13 @@ class CancelThroughLocal(TransformPass):
         new_methods = []
         changed = False
         for method in game.methods:
-            type_map = build_method_type_map(game, method, ctx.proof_let_types)
-            shadowed = method_bound_names(method)
-            block = self._block(method.block, type_map, ctx, shadowed)
+            scope = _MethodScope(
+                build_method_type_map(game, method, ctx.proof_let_types),
+                method_bound_names(method),
+                redeclared_names(game, method),
+                method.signature.name,
+            )
+            block = self._block(method.block, scope, ctx)
             if block is not method.block:
                 changed = True
                 new_methods.append(frog_ast.Method(method.signature, block))
@@ -4099,17 +4181,15 @@ class CancelThroughLocal(TransformPass):
     def _block(
         self,
         block: frog_ast.Block,
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
     ) -> frog_ast.Block:
+        type_map, shadowed = scope.type_map, scope.shadowed
         statements = list(block.statements)
         changed = False
         for index, statement in enumerate(statements):
             if isinstance(statement, frog_ast.IfStatement):
-                blocks = [
-                    self._block(b, type_map, ctx, shadowed) for b in statement.blocks
-                ]
+                blocks = [self._block(b, scope, ctx) for b in statement.blocks]
                 if any(new is not old for new, old in zip(blocks, statement.blocks)):
                     statements[index] = frog_ast.IfStatement(
                         statement.conditions, blocks
@@ -4126,7 +4206,7 @@ class CancelThroughLocal(TransformPass):
                 value, ctx.proof_namespace, ctx.proof_let_types, type_map, shadowed
             ):
                 continue
-            rewritten = self._rewrite(statements, j, value, type_map, ctx, shadowed)
+            rewritten = self._rewrite(statements, j, value, scope, ctx)
             if rewritten is not None:
                 statements[j] = _with_value(statement, rewritten)
                 changed = True
@@ -4137,10 +4217,10 @@ class CancelThroughLocal(TransformPass):
         statements: list[frog_ast.Statement],
         j: int,
         value: frog_ast.Expression,
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
     ) -> Optional[frog_ast.Expression]:
+        type_map, shadowed = scope.type_map, scope.shadowed
         current = value
         improved = False
         for i in range(j - 1, -1, -1):
@@ -4176,6 +4256,14 @@ class CancelThroughLocal(TransformPass):
             )
             _note_kept_constants(normalizer, ctx, self.name)
             if node_count(candidate) < node_count(current):
+                if scope.declines(
+                    ctx,
+                    self.name,
+                    {local}
+                    | referenced_variable_names(local_value)
+                    | referenced_variable_names(current),
+                ):
+                    continue
                 current = candidate
                 improved = True
         return current if improved else None
@@ -4245,44 +4333,51 @@ class BlockedLocalAbsorption(TransformPass):
         new_methods = []
         changed = False
         for method in game.methods:
-            type_map = build_method_type_map(game, method, ctx.proof_let_types)
-            shadowed = method_bound_names(method)
-            block = self._block(method.block, type_map, ctx, shadowed)
-            if block is not method.block:
+            current = method
+            # One absorption at a time: it re-declares the local with the
+            # absorbed expression's type, so the method's types are rebuilt
+            # after each one (F-358).
+            while True:
+                scope = _MethodScope(
+                    build_method_type_map(game, current, ctx.proof_let_types),
+                    method_bound_names(current),
+                    redeclared_names(game, current),
+                    current.signature.name,
+                )
+                block = self._absorb_in_block(current.block, scope, ctx)
+                if block is None:
+                    break
+                current = frog_ast.Method(current.signature, block)
+            if current is not method:
                 changed = True
-                new_methods.append(frog_ast.Method(method.signature, block))
-            else:
-                new_methods.append(method)
+            new_methods.append(current)
         if not changed:
             return game
         return frog_ast.Game((game.name, game.parameters, game.fields, new_methods))
 
-    def _block(
+    def _absorb_in_block(
         self,
         block: frog_ast.Block,
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
-    ) -> frog_ast.Block:
+    ) -> Optional[frog_ast.Block]:
+        """*block* after one absorption in it, trying the blocks of its
+        ``if`` statements first, or None when there is none."""
         statements = list(block.statements)
-        changed = False
         for index, statement in enumerate(statements):
-            if isinstance(statement, frog_ast.IfStatement):
-                blocks = [
-                    self._block(b, type_map, ctx, shadowed) for b in statement.blocks
-                ]
-                if any(new is not old for new, old in zip(blocks, statement.blocks)):
+            if not isinstance(statement, frog_ast.IfStatement):
+                continue
+            for position, inner in enumerate(statement.blocks):
+                new_inner = self._absorb_in_block(inner, scope, ctx)
+                if new_inner is not None:
+                    blocks = list(statement.blocks)
+                    blocks[position] = new_inner
                     statements[index] = frog_ast.IfStatement(
                         statement.conditions, blocks
                     )
-                    changed = True
-        while True:
-            moved = self._absorb_one(statements, type_map, ctx, shadowed)
-            if moved is None:
-                break
-            statements = moved
-            changed = True
-        return frog_ast.Block(statements) if changed else block
+                    return frog_ast.Block(statements)
+        moved = self._absorb_one(statements, scope, ctx)
+        return frog_ast.Block(moved) if moved is not None else None
 
     def _deterministic(
         self,
@@ -4298,10 +4393,10 @@ class BlockedLocalAbsorption(TransformPass):
     def _absorb_one(  # pylint: disable=too-many-locals,too-many-return-statements
         self,
         statements: list[frog_ast.Statement],
-        type_map: NameTypeMap,
+        scope: _MethodScope,
         ctx: PipelineContext,
-        shadowed: set[str],
     ) -> Optional[list[frog_ast.Statement]]:
+        type_map, shadowed = scope.type_map, scope.shadowed
         for i, definition in enumerate(statements):
             if not (
                 isinstance(definition, frog_ast.Assignment)
@@ -4375,6 +4470,8 @@ class BlockedLocalAbsorption(TransformPass):
                 others = referenced_variable_names(ancestor) - {name}
                 if reassigns_or_rebinds(others, window) or (others & declared_late):
                     break
+                if scope.declines(ctx, self.name, others):
+                    break
                 if not self._deterministic(ancestor, ctx, shadowed, type_map):
                     break
                 ancestor_type = infer_type(ancestor, type_map)
@@ -4384,6 +4481,12 @@ class BlockedLocalAbsorption(TransformPass):
                     break
                 chosen, chosen_type = ancestor, ancestor_type
             if chosen is None or chosen_type is None:
+                continue
+            # A second binding of x, or of a name of e, is invisible to the
+            # name-based scans above and has one type in the map (F-370).
+            if scope.declines(
+                ctx, self.name, {name} | referenced_variable_names(value)
+            ):
                 continue
             absorbed = _substitute_variable(chosen, name, value)
             new_use = ReplaceTransformer(chosen, frog_ast.Variable(name)).transform(use)

@@ -70,3 +70,39 @@ def test_no_fire_on_nondeterministic_call() -> None:
     # values: (d + F.Sample()) - F.Sample() is not d.
     game, result = _apply("return (d + F.Sample()) - F.Sample();")
     assert result == game
+
+
+def test_f370_sibling_declarations_are_not_typed_by_the_last_one() -> None:
+    # F-370(a), case N2: the method's type map is last-write-wins, so the
+    # if-block's ModInt locals a and d read as the group elements declared
+    # after the if, and (a / (d * d)) * d ^ 2 cancelled to a as if in a
+    # group. In ModInt<q> it is not a when d = 0. A term that reads neither
+    # name still cancels.
+    game = frog_parser.parse_game(
+        """
+        Game Left(Int q, Group G) {
+            ModInt<q> Probe(Bool c, ModInt<q> a0, ModInt<q> d0, ModInt<q> b, ModInt<q> e, GroupElem<G> h) {
+                if (c) {
+                    ModInt<q> a = a0 * a0 * a0;
+                    ModInt<q> d = d0 * d0 * d0;
+                    return b * ((a / (d * d)) * (d ^ 2)) + ((e + b) - b);
+                }
+                GroupElem<G> a = h * h;
+                GroupElem<G> d = h * h * h;
+                return b + b;
+            }
+        }
+        """
+    )
+    lets = NameTypeMap()
+    lets.set("q", frog_ast.IntType())
+    lets.set("G", frog_ast.GroupType())
+    ctx = PipelineContext(
+        variables={}, proof_let_types=lets, proof_namespace={}, subsets_pairs=[]
+    )
+    result = ModIntCancellation().apply(game, ctx)
+    branch = result.methods[0].block.statements[0]
+    assert isinstance(branch, frog_ast.IfStatement)
+    assert str(branch.blocks[0].statements[-1]).strip() == (
+        "return b * (a / (d * d) * d ^ 2) + e;"
+    )

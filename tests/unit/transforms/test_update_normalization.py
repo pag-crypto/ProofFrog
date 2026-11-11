@@ -189,3 +189,29 @@ def test_mask_no_fire_across_branches_of_one_statement() -> None:
         """
     )
     assert UniformModIntRepeatedMask().apply(game, _ctx()) == game
+
+
+def test_f370_mask_no_fire_past_a_bare_redeclaration() -> None:
+    # F-370(a), case RM1: after the bare re-declaration ModInt<G.order> u;,
+    # the u the return reads is not the draw, so s + u is not uniform.
+    game = _game(
+        "ModInt<G.order> s;",
+        "ModInt<G.order> u <- ModInt<G.order>;\n"
+        "ModInt<G.order> u;\n"
+        "return [G.generator ^ (s + u), s + u, e];",
+    )
+    assert UniformModIntRepeatedMask().apply(game, _ctx()) == game
+
+
+def test_f370_express_after_update_no_fire_past_a_bare_redeclaration() -> None:
+    # F-370(a), case E3: the bare re-declaration ModInt<G.order> v; between
+    # the value and the update was not seen as a use of v; moving the value
+    # below it would make the return read the moved value.
+    game = _game(
+        "ModInt<G.order> s;",
+        "ModInt<G.order> v = s + d;\n"
+        "ModInt<G.order> v;\n"
+        "s = s + d;\n"
+        "return [G.generator ^ v, v, e];",
+    )
+    assert ExpressAfterUpdate().apply(game, _ctx()) == game

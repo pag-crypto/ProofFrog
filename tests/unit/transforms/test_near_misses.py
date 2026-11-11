@@ -4742,3 +4742,127 @@ def test_near_miss_repeated_mask_with_different_partners() -> None:
     ctx = _group_ctx()
     assert UniformModIntRepeatedMask().apply(game, ctx) == game
     assert "Uniform ModInt Repeated Mask" in _names(ctx)
+
+
+def _redeclared_reasons(ctx: PipelineContext, transform: str) -> list[NearMiss]:
+    return [
+        nm
+        for nm in ctx.near_misses
+        if nm.transform_name == transform and "more than once" in nm.reason
+    ]
+
+
+def test_near_miss_blocked_local_absorption_redeclared_local() -> None:
+    # F-370(a): x is declared again (bare) between the blocker and the use.
+    from proof_frog.transforms.algebraic import BlockedLocalAbsorption
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            ModInt<G.order> sk;
+            [GroupElem<G>, ModInt<G.order>] f(ModInt<G.order> d) {
+                ModInt<G.order> x = sk;
+                sk = sk + d;
+                ModInt<G.order> x;
+                return [G.generator ^ sk, x + d];
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert BlockedLocalAbsorption().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "Blocked Local Absorption")
+    assert misses and misses[0].variable == "x" and misses[0].method == "f"
+
+
+def test_near_miss_repeated_mask_redeclared_uniform() -> None:
+    # F-370(a): u is declared again (bare) after the draw.
+    from proof_frog.transforms.algebraic import UniformModIntRepeatedMask
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            ModInt<G.order> s;
+            [GroupElem<G>, ModInt<G.order>] f() {
+                ModInt<G.order> u <- ModInt<G.order>;
+                ModInt<G.order> u;
+                return [G.generator ^ (s + u), s + u];
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert UniformModIntRepeatedMask().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "Uniform ModInt Repeated Mask")
+    assert misses and misses[0].variable == "u"
+
+
+def test_near_miss_express_after_update_redeclared_local() -> None:
+    # F-370(a): v is declared again (bare) between the value and the update.
+    from proof_frog.transforms.algebraic import ExpressAfterUpdate
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Int q) {
+            ModInt<q> f;
+            ModInt<q> Get(ModInt<q> d) {
+                ModInt<q> v = f + d;
+                ModInt<q> v;
+                f = f + d;
+                return v;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert ExpressAfterUpdate().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "Express After Update")
+    assert misses and misses[0].variable == "v"
+
+
+def test_near_miss_cancel_through_local_local_shadows_field() -> None:
+    # F-370(a): the local v shadows the field v its initializer reads.
+    from proof_frog.transforms.algebraic import CancelThroughLocal
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Int q) {
+            ModInt<q> v;
+            ModInt<q> Get(ModInt<q> d) {
+                ModInt<q> v = v + d;
+                return v - d;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert CancelThroughLocal().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "Cancel Through Local")
+    assert misses and misses[0].variable == "v"
+
+
+def test_near_miss_modint_cancellation_redeclared_operand() -> None:
+    # F-370(a): a and e are ModInt locals in the if block and group elements
+    # after it; typed as group elements, (a / e) * e cancelled to a.
+    from proof_frog.transforms.algebraic import ModIntCancellation
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G, Int q) {
+            ModInt<q> f(Bool c, ModInt<q> b, ModInt<q> d, GroupElem<G> h) {
+                if (c) {
+                    ModInt<q> a = d * d;
+                    ModInt<q> e = d + d;
+                    return b + ((a / e) * e);
+                }
+                GroupElem<G> a = h;
+                GroupElem<G> e = h;
+                return d;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert ModIntCancellation().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "ModInt Cancellation")
+    assert misses and misses[0].variable == "a"
