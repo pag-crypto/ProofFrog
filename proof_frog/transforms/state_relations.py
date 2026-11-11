@@ -61,6 +61,8 @@ from ._base import (
     _lookup_primitive_method,
     bound_names,
     calls_are_deterministic,
+    fresh_name,
+    game_names,
     may_return_before,
 )
 
@@ -851,13 +853,15 @@ def _single_assignment_entry(
     target: str,
     target_type: frog_ast.Type,
     expr: frog_ast.Expression,
+    taken: set[str],
 ) -> list[frog_ast.Statement]:
     """Give the removed field's entry value and its new value separate locals.
 
     The method starts with the entry value ``E``. When the first write to
     ``target`` is a top-level assignment, the reads before it (and in its
-    right-hand side) use a local ``target@entry = E``, and the write declares
-    a fresh local ``target``; each local then has one definition, so later
+    right-hand side) use a local ``target@entry = E`` (another fresh name if
+    *taken*, the names of the game, has that one), and the write declares a
+    fresh local ``target``; each local then has one definition, so later
     passes can inline or absorb it. Otherwise ``target`` is one mutable local
     starting at ``E``.
     """
@@ -871,7 +875,7 @@ def _single_assignment_entry(
             and write.the_type is None
             and write.var == frog_ast.Variable(target)
         ):
-            entry = f"{target}@entry"
+            entry = fresh_name(f"{target}@entry", taken)
             reads: dict[str, frog_ast.Expression] = {target: frog_ast.Variable(entry)}
             prefix = [_rewrite_statement(s, {}, reads) for s in body[:first]]
             declaration = frog_ast.Assignment(
@@ -903,6 +907,7 @@ def _eliminate(
     target_type = _field_types(game)[target]
     expr_names = _free_names(expr)
     watched = {target} | (expr_names & set(_field_types(game)))
+    names = game_names(game)
     new_methods: list[frog_ast.Method] = []
     for method in game.methods:
         if not _mentions(method.block, target):
@@ -928,7 +933,9 @@ def _eliminate(
         else:
             body, _ = _substitute_clean(statements, target, expr, watched)
             if _mentions(frog_ast.Block(body), target):
-                body = _single_assignment_entry(body, target, target_type, expr)
+                body = _single_assignment_entry(
+                    body, target, target_type, expr, set(names)
+                )
             statements = body
         new_methods.append(
             frog_ast.Method(copy.deepcopy(method.signature), frog_ast.Block(statements))
@@ -1143,9 +1150,9 @@ class GeneratorPowerFieldToExponent(TransformPass):
             and not _mentions(first_statement.value, name)
         ):
             return None
-        exponent_name = f"{name}@exp"
-        if exponent_name in _field_types(game):
-            return None
+        # The new field must not be named like anything in the game: a local
+        # of that name would capture the rewritten reads and writes (F-370).
+        exponent_name = fresh_name(f"{name}@exp", game_names(game))
         rewrites: dict[int, frog_ast.Statement] = {}
         for method in game.methods:
             if name in bound_names(method):
@@ -1463,17 +1470,17 @@ def _fuse(  # pylint: disable=too-many-return-statements,too-many-locals
     name, offset_name = fixed.name, offset.name
     if fixed.value is not None or offset.value is not None:
         return None
-    fused_name = f"{name}@fused"
-    exponent_name = f"{name}@exp"
-    taken = set(_field_types(game))
     for method in game.methods:
         bound = bound_names(method)
         # A local or parameter named like P or D would capture g ^ (s - D).
         if name in bound or offset_name in bound:
             return None
-        taken |= bound
-    if fused_name in taken or exponent_name in taken:
-        return None
+    # The new field, Initialize's exponent local and the temporaries of
+    # _track_offset must not be named like anything in the game, or they
+    # would capture an existing binding's reads (F-370).
+    taken = game_names(game)
+    fused_name = fresh_name(f"{name}@fused", taken)
+    exponent_name = fresh_name(f"{name}@exp", taken)
     # P is written exactly once, at the top level of Initialize, as g ^ e.
     writes = [w for m in game.methods for w in _writes_of(m.block, name)]
     if len(writes) != 1:
@@ -1579,6 +1586,7 @@ def _fuse(  # pylint: disable=too-many-return-statements,too-many-locals
                             )
                         )
                     },
+                    set(taken),
                 )
             new_methods.append(
                 frog_ast.Method(copy.deepcopy(method.signature), new_block)
@@ -1639,11 +1647,13 @@ def _track_offset(  # pylint: disable=too-many-arguments,too-many-positional-arg
     fused: str,
     zq: frog_ast.Type,
     reads: dict[str, frog_ast.Expression],
+    taken: set[str],
     counter: Optional[itertools.count[int]] = None,
 ) -> frog_ast.Block:
     """Rewrite reads per *reads*, and keep ``fused - offset`` fixed across
     every write ``offset = w`` (``t = w; fused = fused + (t - offset);
-    offset = t;``)."""
+    offset = t;``). Each temporary ``t`` is a name not in *taken* (the
+    names of the game and the temporaries made so far), added to it."""
     if counter is None:
         counter = itertools.count()
     out: list[frog_ast.Statement] = []
@@ -1652,6 +1662,9 @@ def _track_offset(  # pylint: disable=too-many-arguments,too-many-positional-arg
             statement, frog_ast.Assignment
         ) and statement.var == frog_ast.Variable(offset):
             temp = f"{offset}@next{next(counter)}"
+            while temp in taken:
+                temp = f"{offset}@next{next(counter)}"
+            taken.add(temp)
             new_value = _replace_names(statement.value, reads)
             out.append(
                 frog_ast.Assignment(
@@ -1684,7 +1697,7 @@ def _track_offset(  # pylint: disable=too-many-arguments,too-many-positional-arg
                 frog_ast.IfStatement(
                     [_replace_names(c, reads) for c in statement.conditions],
                     [
-                        _track_offset(b, offset, fused, zq, reads, counter)
+                        _track_offset(b, offset, fused, zq, reads, taken, counter)
                         for b in statement.blocks
                     ],
                 )

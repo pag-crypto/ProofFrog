@@ -15,7 +15,7 @@ from sympy import Symbol
 
 from .. import frog_ast
 from ..frog_ast import SourceOrigin
-from ..visitors import NameTypeMap, SearchVisitor
+from ..visitors import NameTypeMap, SearchVisitor, referenced_variable_names
 
 _MAX_FIXED_POINT_ITERATIONS = 200
 
@@ -216,6 +216,34 @@ def bound_names(method: frog_ast.Method) -> set[str]:
 
     SearchVisitor(_collect).visit(method.block)
     return names
+
+
+def game_names(game: frog_ast.Game) -> set[str]:
+    """Every name *game* binds or mentions: its parameters and fields, each
+    method's :func:`bound_names`, and every variable it references (type
+    positions included).
+
+    A name a pass adds to *game* (a new field or local) must be none of
+    these: otherwise the new binding captures reads of the existing one, or
+    a declaration of the existing name captures reads of the new one."""
+    names = {param.name for param in game.parameters}
+    names |= {field.name for field in game.fields}
+    names |= referenced_variable_names(game)
+    for method in game.methods:
+        names |= bound_names(method)
+    return names
+
+
+def fresh_name(base: str, taken: set[str]) -> str:
+    """*base* if it is not in *taken*, else the first ``base@fresh<k>``
+    (k = 1, 2, ...) that is not. The name returned is added to *taken*, so
+    successive calls with the same set return distinct names."""
+    name, k = base, 0
+    while name in taken:
+        k += 1
+        name = f"{base}@fresh{k}"
+    taken.add(name)
+    return name
 
 
 class TransformPass(ABC):

@@ -32,9 +32,10 @@ from ._base import (
     TransformPass,
     PipelineContext,
     NearMiss,
+    fresh_name,
+    game_names,
     has_nondeterministic_call,
     may_return_before,
-    method_bound_names,
 )
 
 # ---------------------------------------------------------------------------
@@ -2714,10 +2715,22 @@ class SplitProductSampleTransformer(BlockTransformer):
     Sound: the uniform distribution on a product of types is the product of
     the uniform distributions on the components, so the components of one
     product draw are independent uniform draws.
+
+    Each component is a new local named ``v@i``, or another fresh name when
+    the game already binds or mentions ``v@i`` (a field ExpandTuple made from
+    a product field ``v``, a bare declaration from SplitBareTupleDeclarations):
+    reusing it would capture that binding's reads (F-369).
     """
 
-    def __init__(self, bound_names: set[str]) -> None:
-        self.bound_names = bound_names
+    def __init__(self, names_in_game: set[str]) -> None:
+        self.names_in_game = names_in_game
+        self.taken: set[str] = set(names_in_game)
+
+    def transform_method(self, method: frog_ast.Method) -> frog_ast.Method:
+        # The components are locals of this method: fresh against every name
+        # of the game and the components already made in this method.
+        self.taken = set(self.names_in_game)
+        return self._transform_children(method)
 
     def _transform_block_wrapper(self, block: frog_ast.Block) -> frog_ast.Block:
         statements = list(block.statements)
@@ -2735,15 +2748,15 @@ class SplitProductSampleTransformer(BlockTransformer):
                 continue
             name = statement.var.name
             types = list(statement.the_type.types)
-            names = [f"{name}@{i}" for i in range(len(types))]
-            if any(n in self.bound_names for n in names):
-                continue
             rest = frog_ast.Block(statements[index + 1 :])
             if reassigns_or_rebinds({name}, rest):
                 continue
+            taken = set(self.taken)
+            names = [fresh_name(f"{name}@{i}", taken) for i in range(len(types))]
             new_rest = _IndexToComponent(name, names).transform(rest)
             if name in referenced_variable_names(new_rest):
                 continue
+            self.taken = taken
             samples: list[frog_ast.Statement] = [
                 frog_ast.Sample(
                     copy.deepcopy(component),
@@ -2762,7 +2775,4 @@ class SplitProductSample(TransformPass):
     name = "Split Product Sample"
 
     def apply(self, game: frog_ast.Game, ctx: PipelineContext) -> frog_ast.Game:
-        bound: set[str] = set()
-        for method in game.methods:
-            bound |= method_bound_names(method)
-        return SplitProductSampleTransformer(bound).transform(game)
+        return SplitProductSampleTransformer(game_names(game)).transform(game)
