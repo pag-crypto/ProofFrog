@@ -1792,6 +1792,25 @@ def _note_kept_constants(
                 )
             )
             continue
+        if kept.value is None:
+            ctx.near_misses.append(
+                NearMiss(
+                    transform_name=transform_name,
+                    reason=(
+                        f"'{kept.expr}' simplifies in ModInt<{kept.modulus}> "
+                        "only to a polynomial with a constant term or a large "
+                        "coefficient, kept as written: FrogLang has no "
+                        f"ModInt<{kept.modulus}> literal for either"
+                    ),
+                    location=kept.expr.origin,
+                    suggestion=(
+                        "Write the expression in its simplified form on both " "sides"
+                    ),
+                    variable=None,
+                    method=None,
+                )
+            )
+            continue
         ctx.near_misses.append(
             NearMiss(
                 transform_name=transform_name,
@@ -1878,7 +1897,12 @@ class ModIntCancellationTransformer(MethodScopedTypeMapMixin):
             self.type_map,
             self._shadowed,
         )
-        normalizer = Normalizer(self.type_map, self._proof_namespace)
+        # No Int literal next to a ModInt operand in the result (F-370(h)):
+        # (u + s) + (u - s) becomes u + u, not 2 * u, which the type helpers
+        # here read by its literal as an Int.
+        normalizer = Normalizer(
+            self.type_map, self._proof_namespace, ring_literals=False
+        )
         rebuilt = normalizer.canonical(expr, position)
         _note_kept_constants(normalizer, self.ctx, "ModInt Cancellation")
         kept = normalizer.kept_constants

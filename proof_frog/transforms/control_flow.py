@@ -829,6 +829,50 @@ def _implied_facts(
     return facts
 
 
+def _bool_flags(game: frog_ast.Game | None, method: frog_ast.Method) -> set[str]:
+    """The names each of whose declarations in *method* (its parameters and
+    typed locals) and in *game* (its parameters and fields) is a ``Bool``.
+
+    Every declaration counts, not only the last one, so a name declared
+    ``Bool`` in one block and another type elsewhere is not a flag."""
+    types: dict[str, list[frog_ast.Type]] = {}
+
+    def add(name: str, the_type: frog_ast.Type) -> None:
+        types.setdefault(name, []).append(the_type)
+
+    if game is not None:
+        for parameter in game.parameters:
+            add(parameter.name, parameter.type)
+        for field in game.fields:
+            add(field.name, field.type)
+    for parameter in method.signature.parameters:
+        add(parameter.name, parameter.type)
+
+    def visit(node: frog_ast.ASTNode) -> bool:
+        if (
+            isinstance(
+                node, (frog_ast.Assignment, frog_ast.Sample, frog_ast.UniqueSample)
+            )
+            and node.the_type is not None
+            and isinstance(node.var, frog_ast.Variable)
+        ):
+            add(node.var.name, node.the_type)
+        elif isinstance(node, frog_ast.VariableDeclaration):
+            add(node.name, node.type)
+        elif isinstance(node, frog_ast.NumericFor):
+            add(node.name, frog_ast.IntType())
+        elif isinstance(node, frog_ast.GenericFor):
+            add(node.var_name, node.var_type)
+        return False
+
+    SearchVisitor(visit).visit(method.block)
+    return {
+        name
+        for name, declared in types.items()
+        if all(isinstance(the_type, frog_ast.BoolType) for the_type in declared)
+    }
+
+
 class GuardConditionSimplificationTransformer(Transformer):
     """Replaces an if-condition by its known truth value inside its branches.
 
@@ -851,6 +895,24 @@ class GuardConditionSimplificationTransformer(Transformer):
 
     def __init__(self, ctx: PipelineContext | None = None) -> None:
         self.ctx = ctx
+        self._game: frog_ast.Game | None = None
+        self._flags: set[str] = set()
+
+    def transform_game(self, game: frog_ast.Game) -> frog_ast.Game:
+        saved = self._game
+        self._game = game
+        try:
+            return self._transform_children(game)
+        finally:
+            self._game = saved
+
+    def transform_method(self, method: frog_ast.Method) -> frog_ast.Method:
+        saved = self._flags
+        self._flags = _bool_flags(self._game, method)
+        try:
+            return self._transform_children(method)
+        finally:
+            self._flags = saved
 
     def _is_deterministic(self, expr: frog_ast.Expression) -> bool:
         namespace = self.ctx.proof_namespace if self.ctx else {}
@@ -891,11 +953,15 @@ class GuardConditionSimplificationTransformer(Transformer):
         are what lets a compound guard such as ``revealed || !challenged``
         settle a later ``if (revealed)``, while replacing a comparison by a
         constant would hide it from the passes that reason about it (e.g.
-        ``FoldEquivalentReturnBranch``)."""
+        ``FoldEquivalentReturnBranch``). A part is a flag only if every
+        declaration of its name is a ``Bool`` (F-370(f)): ``||`` is also
+        bit-string concatenation, and the decomposition does not look at
+        operand types."""
         replace_map = frog_ast.ASTMap[frog_ast.ASTNode](identity=False)
         for index, (fact, fact_value) in enumerate(_implied_facts(cond, value)):
             if not (
-                (index == 0 and whole_condition) or isinstance(fact, frog_ast.Variable)
+                (index == 0 and whole_condition)
+                or (isinstance(fact, frog_ast.Variable) and fact.name in self._flags)
             ):
                 continue
             try:

@@ -5033,3 +5033,80 @@ def test_near_miss_modint_cancellation_redeclared_operand() -> None:
     assert ModIntCancellation().apply(game, ctx) == game
     misses = _redeclared_reasons(ctx, "ModInt Cancellation")
     assert misses and misses[0].variable == "a"
+
+
+def test_near_miss_modint_cancellation_keeps_large_coefficient() -> None:
+    # F-370(h): (5u + s) - s is 5u; with no Int literal next to a ModInt the
+    # rebuild would be five copies of u added up, past the cap, so the
+    # expression is kept as written.
+    from proof_frog.transforms.algebraic import ModIntCancellation
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Int q) {
+            ModInt<q> f(ModInt<q> u, ModInt<q> s) {
+                return ((((u + u) + u) + u) + u + s) - s;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    result = ModIntCancellation().apply(game, ctx)
+    assert "5 *" not in str(result)
+    reasons = _kept_constant_reasons(ctx, "ModInt Cancellation")
+    assert reasons and "large coefficient" in reasons[0]
+
+
+def test_near_miss_gpfe_redeclared_exponent_local() -> None:
+    # F-370(j): d is declared in both branches; typed by the method's
+    # last-write-wins map, its type may not be the one each write reads.
+    from proof_frog.transforms.state_relations import GeneratorPowerFieldToExponent
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            GroupElem<G> h;
+            Void Initialize() {
+                ModInt<G.order> e <- ModInt<G.order>;
+                h = G.generator ^ e;
+            }
+            GroupElem<G> Upd(Bool c, ModInt<G.order> r) {
+                if (c) { ModInt<G.order> d = r; h = h * G.generator ^ d; }
+                else { ModInt<G.order> d = r + r; h = h * G.generator ^ d; }
+                return h;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert GeneratorPowerFieldToExponent().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "Generator Power Field To Exponent")
+    assert misses and misses[0].variable == "d"
+
+
+def test_near_miss_offset_fusion_redeclared_exponent_local() -> None:
+    # F-370(j): Initialize declares e twice, and P's write reads e.
+    from proof_frog.transforms.state_relations import OffsetFusion
+
+    game = frog_parser.parse_game(
+        """
+        Game T(Group G) {
+            GroupElem<G> P;
+            ModInt<G.order> D;
+            Void Initialize(Bool c) {
+                ModInt<G.order> e <- ModInt<G.order>;
+                P = G.generator ^ e;
+                D = 0;
+                if (c) { ModInt<G.order> e <- ModInt<G.order>; D = e; }
+            }
+            GroupElem<G> Shift(ModInt<G.order> r) {
+                D = D + r;
+                return P * G.generator ^ D;
+            }
+        }
+        """
+    )
+    ctx = _group_ctx()
+    assert OffsetFusion().apply(game, ctx) == game
+    misses = _redeclared_reasons(ctx, "Offset Fusion")
+    assert misses and misses[0].variable == "e"

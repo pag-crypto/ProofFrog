@@ -52,6 +52,7 @@ from ..visitors import (
     build_method_type_map,
     lvalue_base_name,
     reassigns_or_rebinds,
+    store_may_change_value,
 )
 from ._algebra import GroupForm, Normalizer, infer_type, is_order_of
 from ._base import (
@@ -65,6 +66,7 @@ from ._base import (
     game_names,
     may_return_before,
 )
+from ._definedness import note_redeclared_name, redeclared_names
 
 _SYMBOL_PREFIX = "inv@"
 _MAX_PATHS = 256
@@ -565,11 +567,14 @@ def _coerces(
 ) -> bool:
     """True if storing a value of *value_type* in a variable of *declared*
     type may change it (an Int stored in a ModInt is reduced, a ModInt read
-    as an Int is its representative), or the types cannot be compared."""
+    as an Int is its representative), or the types cannot be compared. A
+    tuple, optional, map or other compound target may change a value the
+    same way through a ``ModInt`` part (F-370(g)), judged by
+    :func:`~proof_frog.visitors.store_may_change_value`."""
     numeric = (frog_ast.IntType, frog_ast.ModIntType)
     if isinstance(declared, numeric):
         return value_type is None or not bool(value_type == declared)
-    return False
+    return store_may_change_value(declared, value_type)
 
 
 def _written_names(node: frog_ast.ASTNode) -> set[str]:
@@ -645,7 +650,9 @@ def _preserves(
             {target} | expr_fields, method.block
         ):
             continue
-        if _shadows_fields(game, method):
+        # The executor types names with the method's last-write-wins map, so
+        # a name bound more than once would get one type for every binding.
+        if _shadows_fields(game, method) or redeclared_names(game, method):
             return False, method.signature.name
         executor = _SymbolicExecutor(
             build_method_type_map(game, method, ctx.proof_let_types), ctx, counter
@@ -946,32 +953,42 @@ def _eliminate(
     )
 
 
-_proof_cache: "OrderedDict[tuple[str, str, str], tuple[bool, Optional[str]]]" = (
-    OrderedDict()
-)
+_proof_cache: "OrderedDict[str, tuple[bool, Optional[str]]]" = OrderedDict()
 
 
-def _context_fingerprint(ctx: PipelineContext) -> str:
+def _context_fingerprint(ctx: PipelineContext) -> object:
     """What a proof by :func:`_preserves` reads from *ctx*: which calls are
     deterministic (primitive method annotations, let-bound Functions) and the
     let types. Part of the cache key, so a long-lived process (the language
     server) never reuses a verdict across proofs that differ in these."""
     primitives = sorted(
         (
-            name,
-            tuple((m.name, m.deterministic, str(m.return_type)) for m in value.methods),
-        )
-        for name, value in ctx.proof_namespace.items()
-        if isinstance(value, frog_ast.Primitive)
+            (
+                name,
+                [(m.name, m.deterministic, m.return_type) for m in value.methods],
+            )
+            for name, value in ctx.proof_namespace.items()
+            if isinstance(value, frog_ast.Primitive)
+        ),
+        key=lambda entry: entry[0],
     )
-    lets = sorted((pair.name, str(pair.type)) for pair in ctx.proof_let_types.type_map)
-    return repr((primitives, lets))
+    return (primitives, ctx.proof_let_types)
 
 
 def _cached_preserves(
     game: frog_ast.Game, target: str, expr: frog_ast.Expression, ctx: PipelineContext
 ) -> tuple[bool, Optional[str]]:
-    key = (str(game), target, str(expr) + "|" + _context_fingerprint(ctx))
+    # The key is a structural digest of the inputs, not their printed text:
+    # two different games can print alike (F-370(d)), and a verdict for one
+    # must never answer for the other. A lazy import, since hop_cache imports
+    # the transforms package.
+    # pylint: disable-next=import-outside-toplevel
+    from ..hop_cache import Uncacheable, structural_digest
+
+    try:
+        key = structural_digest((game, target, expr, _context_fingerprint(ctx)))
+    except Uncacheable:
+        return _preserves(game, target, expr, ctx)
     if key in _proof_cache:
         _proof_cache.move_to_end(key)
         return _proof_cache[key]
@@ -1159,6 +1176,7 @@ class GeneratorPowerFieldToExponent(TransformPass):
                 return None
             method_types = build_method_type_map(game, method, ctx.proof_let_types)
             normalizer = Normalizer(method_types)
+            redeclared = redeclared_names(game, method)
             for write in _writes_of(method.block, name):
                 if not (
                     isinstance(write, frog_ast.Assignment)
@@ -1167,6 +1185,13 @@ class GeneratorPowerFieldToExponent(TransformPass):
                 ):
                     self._near_miss(
                         ctx, name, method, "is written other than by assignment"
+                    )
+                    return None
+                # Atoms are typed with the method's last-write-wins map.
+                clash = sorted(_free_names(write.value) & redeclared)
+                if clash:
+                    note_redeclared_name(
+                        ctx, self.name, clash[0], method.signature.name
                     )
                     return None
                 # The group normal form merges equal calls into one atom, which
@@ -1497,6 +1522,11 @@ def _fuse(  # pylint: disable=too-many-return-statements,too-many-locals
     ) or may_return_before(statements, index):
         return None
     init_types = build_method_type_map(game, init, ctx.proof_let_types)
+    # Atoms are typed with Initialize's last-write-wins map.
+    clash = sorted(_free_names(write.value) & redeclared_names(game, init))
+    if clash:
+        note_redeclared_name(ctx, OffsetFusion.name, clash[0], "Initialize")
+        return None
     if not calls_are_deterministic(
         write.value,
         ctx.proof_namespace,
@@ -1623,6 +1653,9 @@ def _before_exits(
                         [walk(inner, False) for inner in statement.blocks],
                     )
                 )
+            elif isinstance(statement, frog_ast.Block):
+                # A bare block (F-370(i)): a return inside it is an exit too.
+                out.append(walk(statement, False))
             elif isinstance(statement, (frog_ast.NumericFor, frog_ast.GenericFor)):
                 if (
                     SearchVisitor(
@@ -1703,9 +1736,17 @@ def _track_offset(  # pylint: disable=too-many-arguments,too-many-positional-arg
                 )
             )
             continue
-        if isinstance(statement, (frog_ast.NumericFor, frog_ast.GenericFor)):
-            if _writes_of(statement, offset):
-                raise _Unsupported("offset written inside a loop")
+        if isinstance(statement, frog_ast.Block):
+            # A bare block (F-370(i)): its writes of the offset are tracked
+            # like the top level's.
+            out.append(
+                _track_offset(statement, offset, fused, zq, reads, taken, counter)
+            )
+            continue
+        if _writes_of(statement, offset):
+            # Only the statement kinds above keep ``fused - offset`` fixed;
+            # any other write of the offset (in a loop, say) would not.
+            raise _Unsupported("offset written inside a loop or other statement")
         out.append(_rewrite_statement(statement, {}, reads))
     return frog_ast.Block(out)
 

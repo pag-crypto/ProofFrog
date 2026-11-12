@@ -268,6 +268,11 @@ class StructForm:
 NormalForm = Union[ModIntForm, GroupForm, StructForm]
 
 
+# The largest coefficient a ModInt polynomial term is rebuilt with, as that
+# many copies of the term added up (see Normalizer._rebuild_ring_poly).
+_MAX_REPEATED_TERM = 4
+
+
 @dataclass
 class KeptConstant:
     """A ``ModInt<modulus>`` expression :meth:`Normalizer.canonical` kept as
@@ -279,10 +284,12 @@ class KeptConstant:
     although it holds for ``q = 2``). The constant ``0`` is kept only where
     an ``Int`` operand changes the operation; *position* then names that
     place (for example ``"the base of a power"``), and is None otherwise.
+    *value* is None for a non-constant polynomial kept for a constant term
+    or a coefficient too large to write as repeated addition (F-370(h)).
     """
 
     expr: frog_ast.Expression
-    value: int
+    value: Optional[int]
     modulus: frog_ast.Expression
     position: Optional[str] = None
 
@@ -294,11 +301,14 @@ class Normalizer:
         self,
         type_map: NameTypeMap,
         namespace: Optional[frog_ast.Namespace] = None,
+        ring_literals: bool = True,
     ) -> None:
         self.type_map = type_map
         self.namespace = namespace or {}
+        # False: rebuild a non-constant ModInt polynomial with no integer
+        # literal next to a ModInt operand (see _rebuild_ring_poly).
+        self.ring_literals = ring_literals
         self.atoms = AtomTable()
-        self._generators: dict[str, sympy.Symbol] = {}
         # Every expression canonical() kept as written (see KeptConstant), so
         # that a pass can report a near miss.
         self.kept_constants: list[KeptConstant] = []
@@ -370,8 +380,10 @@ class Normalizer:
         ModInt, Int and group-element subexpressions are rebuilt from their
         normal forms; everything else is rebuilt with canonical children.
         One exception: a ``ModInt`` arithmetic expression whose value is a
-        nonzero constant has no ``ModInt``-typed rebuild, so it is kept as
-        written and recorded in :attr:`kept_constants`.
+        nonzero constant (or, with ``ring_literals`` off, a polynomial with a
+        nonzero constant term or a large coefficient, see
+        :meth:`_rebuild_ring_poly`) has no ``ModInt``-typed rebuild, so it is
+        kept as written and recorded in :attr:`kept_constants`.
 
         *position*, when given, says that *expr* is an operand whose
         replacement by an ``Int`` would change the operation it sits in (for
@@ -397,7 +409,7 @@ class Normalizer:
             self.kept_constants.append(
                 KeptConstant(
                     copy.deepcopy(expr),
-                    int(poly),
+                    int(poly) if poly.is_number else None,
                     copy.deepcopy(modulus),
                     position if poly == 0 else None,
                 )
@@ -483,14 +495,67 @@ class Normalizer:
 
         A non-constant polynomial is rebuilt with an atom in its first term,
         so the result has the ring's type and its integer literals are read
-        in that ring. A constant ``c`` is an ``Int`` literal: that is the
-        ``ModInt`` value only for ``c = 0`` (``0 mod q`` is ``0`` for every
-        ``q``), so any other constant of a ``ModInt`` ring gives None.
+        in that ring; with ``ring_literals`` off, a non-constant ``ModInt``
+        polynomial is rebuilt without integer literals
+        (:meth:`_rebuild_ring_poly`), or None when it has no such rebuild. A
+        constant ``c`` is an ``Int`` literal: that is the ``ModInt`` value
+        only for ``c = 0`` (``0 mod q`` is ``0`` for every ``q``), so any
+        other constant of a ``ModInt`` ring gives None.
         """
         poly = sympy.expand(poly)
         if modulus is not None and poly.is_number and poly != 0:
             return None
+        if modulus is not None and not poly.is_number and not self.ring_literals:
+            return self._rebuild_ring_poly(poly)
         return self._rebuild_poly(poly)
+
+    def _rebuild_ring_poly(self, poly: sympy.Expr) -> Optional[frog_ast.Expression]:
+        """A non-constant ``ModInt`` polynomial rebuilt with no integer
+        literal next to a ``ModInt`` operand (F-370(h)): FrogLang refuses
+        ``2 * u`` and ``u + 1`` for a ``ModInt`` ``u``, and the engine's own
+        type helpers read such a shape by its literal, as an ``Int``. A term
+        with coefficient ``k`` is ``k`` copies of the term added up (``u +
+        u``); a nonzero constant term, or a coefficient above
+        :data:`_MAX_REPEATED_TERM`, has no such rebuild and gives None."""
+        result: Optional[frog_ast.Expression] = None
+        for term in poly.as_ordered_terms():
+            coeff, rest = term.as_coeff_Mul()
+            if rest == 1 or not coeff.is_integer:
+                return None
+            negative = coeff < 0
+            magnitude = int(-coeff if negative else coeff)
+            if magnitude > _MAX_REPEATED_TERM:
+                return None
+            factors: list[frog_ast.Expression] = []
+            for factor in sympy.Mul.make_args(rest):
+                base, exp = factor.as_base_exp()
+                atom = self.atoms.expression(base)
+                factors.append(
+                    atom
+                    if exp == 1
+                    else frog_ast.BinaryOperation(
+                        _Ops.EXPONENTIATE, atom, frog_ast.Integer(int(exp))
+                    )
+                )
+            term_ast = factors[0]
+            for factor_ast in factors[1:]:
+                term_ast = frog_ast.BinaryOperation(_Ops.MULTIPLY, term_ast, factor_ast)
+            summed = term_ast
+            for _ in range(magnitude - 1):
+                summed = frog_ast.BinaryOperation(
+                    _Ops.ADD, summed, copy.deepcopy(term_ast)
+                )
+            if result is None:
+                result = (
+                    frog_ast.UnaryOperation(frog_ast.UnaryOperators.MINUS, summed)
+                    if negative
+                    else summed
+                )
+            else:
+                result = frog_ast.BinaryOperation(
+                    _Ops.SUBTRACT if negative else _Ops.ADD, result, summed
+                )
+        return result
 
     def _rebuild_poly(self, poly: sympy.Expr) -> frog_ast.Expression:
         poly = sympy.expand(poly)
@@ -537,13 +602,13 @@ class Normalizer:
     def _generator_symbol(
         self, group: frog_ast.Expression, generator: frog_ast.Expression
     ) -> sympy.Symbol:
-        key = str(group)
-        if key not in self._generators:
-            self._generators[key] = self.atoms.symbol(
-                frog_ast.FieldAccess(copy.deepcopy(group), "generator")
-            )
+        # The atom table matches atoms structurally, so two groups that print
+        # alike (a Variable named ``E.G`` and the access ``E.G``) get distinct
+        # generator symbols (F-370(e)).
         del generator
-        return self._generators[key]
+        return self.atoms.symbol(
+            frog_ast.FieldAccess(copy.deepcopy(group), "generator")
+        )
 
     def _group(
         self, expr: frog_ast.Expression, group: frog_ast.Expression
