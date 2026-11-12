@@ -187,17 +187,17 @@ CASES = [
      "(x - x) ^ 0 became the Int 0 ^ 0, which Symbolic Computation folded to 1"),
     ("F-364", "power_of_zero_control.proof", "accept", "ModIntSimplification",
      "positive control: x^0 * y, and x ^ 0 returned or stored as ModInt<q>"),
-    ("F-357", "exponent_constant.proof", "reject", "ModIntCancellation",
+    ("F-357", "exponent_constant.proof", "type_error", "ModIntCancellation",
      "a ModInt<q> exponent equal to the constant 2 was rebuilt as the Int 2"),
-    ("F-357", "express_after_update.proof", "reject", "ExpressAfterUpdate",
+    ("F-357", "express_after_update.proof", "type_error", "ExpressAfterUpdate",
      "the moved value's ModInt<q> constant exponent was rebuilt as an Int"),
-    ("F-357", "cancel_through_local.proof", "reject", "CancelThroughLocal",
+    ("F-357", "cancel_through_local.proof", "type_error", "CancelThroughLocal",
      "the substituted value's ModInt<q> constant exponent was rebuilt as an Int"),
-    ("F-357", "zero_constant_control.proof", "accept", "ModIntCancellation",
+    ("F-357", "zero_constant_control.proof", "type_error", "ModIntCancellation",
      "positive control: a ModInt<q> value equal to 0 still cancels to 0"),
-    ("F-358", "stale_type.proof", "reject", "BlockedLocalAbsorption",
+    ("F-358", "stale_type.proof", "type_error", "BlockedLocalAbsorption",
      "a second round typed the re-declared local by the stale type map"),
-    ("F-358", "stale_type_control.proof", "accept", "BlockedLocalAbsorption",
+    ("F-358", "stale_type_control.proof", "type_error", "BlockedLocalAbsorption",
      "positive control: the round that re-declares the local as Int still fires"),
     ("F-359", "gpfe_initializer.proof", "reject", "GeneratorPowerFieldToExponent",
      "another field's initializer kept naming the removed field, read as a let"),
@@ -413,13 +413,13 @@ CASES = [
      "pk == g^sk is preserved on one branch of an oracle only"),
     ("STATE-RELATIONS", "true_invariant_control.proof", "accept",
      "FieldInvariantElimination", "positive control: a preserved pk == g^sk"),
-    ("STATE-RELATIONS", "coerced_invariant.proof", "reject",
+    ("STATE-RELATIONS", "coerced_invariant.proof", "type_error",
      "FieldInvariantElimination",
      "a ModInt field holding an Int reduced mod q was related to the raw Int"),
-    ("STATE-RELATIONS", "coerced_absorption.proof", "reject",
+    ("STATE-RELATIONS", "coerced_absorption.proof", "type_error",
      "BlockedLocalAbsorption",
      "moving a ModInt local's Int initializer dropped its reduction mod q"),
-    ("STATE-RELATIONS", "coerced_literal.proof", "reject",
+    ("STATE-RELATIONS", "coerced_literal.proof", "type_error",
      "ForwardLiteralFieldWrite",
      "the literal 7 was forwarded for a ModInt field holding 7 mod q"),
     ("STATE-RELATIONS", "absorbed_key.proof", "reject",
@@ -511,6 +511,42 @@ TYPE_ERROR = {
     ),
     ("ARITH-PRECEDENCE", "same_level_control.proof"): (
         "error: Cannot use operator / on Int"
+    ),
+    ("F-357", "exponent_constant.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("F-357", "express_after_update.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("F-357", "cancel_through_local.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("F-357", "zero_constant_control.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("F-358", "stale_type.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("F-358", "stale_type_control.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("STATE-RELATIONS", "coerced_invariant.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("STATE-RELATIONS", "coerced_absorption.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
+    ),
+    ("STATE-RELATIONS", "coerced_literal.proof"): (
+        "error: Exponent of a GroupElem<G> must have type Int or"
+        " ModInt<G.order>, got ModInt<q>"
     ),
 }
 
